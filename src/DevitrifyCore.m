@@ -12,6 +12,11 @@
 extern bool _os_feature_enabled_impl(const char *domain, const char *feature);
 
 // libDevitrify.dylib (the loader) knows whether this app keeps Liquid Glass.
+static BOOL dv_compatibilityModeViaLoader(void) {
+    int (*compat)(void) = dlsym(RTLD_DEFAULT, "devitrify_compatibility_mode");
+    return compat && compat();
+}
+
 static BOOL dv_keepsLiquidGlassViaLoader(void) {
     int (*keeps)(void) = dlsym(RTLD_DEFAULT, "devitrify_keeps_liquid_glass");
     return keeps && keeps();
@@ -294,7 +299,8 @@ static NSString *dv_keepMarkerPath(void) {
 
 static BOOL dv_keepsLiquidGlass(void) {
     if (dv_isSandboxed()) return [NSFileManager.defaultManager fileExistsAtPath:dv_keepMarkerPath()];
-    return [dv_liquidGlassAppsLines() containsObject:dv_appName()];
+    NSArray *lines = dv_liquidGlassAppsLines();
+    return [lines containsObject:dv_appName()] || [lines containsObject:[dv_appName() stringByAppendingString:@" compat"]];
 }
 
 // Whether Liquid Glass is turned off for this app because it is disabled system-wide.
@@ -337,7 +343,7 @@ static void dv_reopenApp(void) {
         }
     } else {
         NSMutableArray<NSString *> *lines = dv_liquidGlassAppsLines();
-        if (keep) [lines addObject:name]; else [lines removeObject:name];
+        if (keep) [lines addObject:name]; else { [lines removeObject:name]; [lines removeObject:[name stringByAppendingString:@" compat"]]; }
         NSString *text = [[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
         if (![text writeToFile:dv_liquidGlassAppsPath() atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
     }
@@ -398,7 +404,7 @@ static void DevitrifyInit(void) {
         s_liquidGlassOffSystemWide = dv_keepsLiquidGlassViaLoader() || !_os_feature_enabled_impl("SwiftUI", "Solarium");
         if (_os_feature_enabled_impl("SwiftUI", "Solarium")) {
             dv_installGlassFilterNeutralization();
-            if (dv_keepsLiquidGlassViaLoader()) dv_installClassicAppKit();
+            if (dv_keepsLiquidGlassViaLoader() && !dv_compatibilityModeViaLoader()) dv_installClassicAppKit();
         } else {
             dv_installFrostedGlassFallback();
         }
