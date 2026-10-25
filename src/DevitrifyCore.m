@@ -356,22 +356,35 @@ static void dv_installKeepLiquidGlassItem(void) {
 
     static DVKeepLiquidGlassItemTarget *target;
     target = [[DVKeepLiquidGlassItemTarget alloc] init];
-    // Apps can rebuild their menus, so the item is (re)added whenever the app activates.
-    void (^addItem)(NSNotification *) = ^(NSNotification *note) {
-        (void)note;
+
+    // SwiftUI apps rebuild their menus whenever their state changes, which removes the item,
+    // so it is added again after every change to the Help menu.
+    static __weak NSMenu *observedMenu;
+    static void (^addItem)(void);
+    addItem = ^{
         NSMenu *help = NSApp.helpMenu;
-        if (!help || [help indexOfItemWithTarget:target andAction:@selector(toggleKeepLiquidGlass:)] >= 0) return;
-        [help addItem:NSMenuItem.separatorItem];
-        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"Keep Liquid Glass" action:@selector(toggleKeepLiquidGlass:) keyEquivalent:@""];
-        item.target = target;
-        [help addItem:item];
+        if (!help) return;
+        if ([help indexOfItemWithTarget:target andAction:@selector(toggleKeepLiquidGlass:)] < 0) {
+            if (help.numberOfItems > 0) [help addItem:NSMenuItem.separatorItem];
+            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"Keep Liquid Glass" action:@selector(toggleKeepLiquidGlass:) keyEquivalent:@""];
+            item.target = target;
+            [help addItem:item];
+        }
+        if (observedMenu != help) {
+            observedMenu = help;
+            [NSNotificationCenter.defaultCenter addObserverForName:NSMenuDidChangeItemNotification object:help queue:nil usingBlock:^(NSNotification *note) {
+                (void)note;
+                dispatch_async(dispatch_get_main_queue(), addItem);
+            }];
+        }
     };
     for (NSNotificationName name in @[NSApplicationDidFinishLaunchingNotification, NSApplicationDidBecomeActiveNotification]) {
-        [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue usingBlock:addItem];
+        [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            (void)note;
+            addItem();
+        }];
     }
 }
-
-#pragma mark - Master Constructor
 
 __attribute__((constructor))
 static void DevitrifyInit(void) {
