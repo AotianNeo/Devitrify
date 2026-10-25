@@ -54,28 +54,31 @@ Apps and services only load Devitrify when they launch. To reload the ones that 
 
 Add `-n` to only list them. Add bundle identifiers such as `com.apple.Music` to reload only those apps, even if they already have Devitrify loaded.
 
-## Tip: Keep Liquid Glass for specific apps
-Apps built with SwiftUI's `.glassEffect()` lose their glass shapes when Liquid Glass is disabled, for example Calculator's keys or AlDente's menu. Such an app can keep Liquid Glass, which Devitrify then turns into frosted glass: choose Help > Keep Liquid Glass in the app and let it reopen. Choose it again to undo. Sandboxed apps, which include most apps that come with macOS, keep a marker file in their own container instead of the list below.
+## Apps that use SwiftUI glass
+Apps built with SwiftUI's `.glassEffect()` lose their glass shapes when Liquid Glass is disabled, for example Calculator's keys. Devitrify finds such apps by themselves: when an app's executable imports SwiftUI's glass effect, the app runs with Liquid Glass in its compatibility mode, the way apps built with an older SDK run on macOS 26 and later. Glass keeps its shape, Devitrify turns it into frosted glass, and the controls that SwiftUI and AppKit draw stay classic. The interface frameworks are told that the app was built with the macOS 15 SDK, and SwiftUI's pop-up buttons get the accessibility attribute they are missing, which would otherwise crash the app when an accessibility client such as a window manager looks at them.
 
-Menu bar apps such as AlDente have no visible Help menu. Add their name to `/Users/Shared/.devitrify/liquid-glass-apps` and reload them instead:
+Choose Help > Keep Liquid Glass in an app to turn this off for it, and choose it again to turn it back on. The app asks to reopen. Apps without a visible Help menu, such as menu bar apps, are configured in `/Users/Shared/.devitrify/liquid-glass-apps`, one app per line, named by the file name without `.app`:
 
 ```
-echo AlDente >> /Users/Shared/.devitrify/liquid-glass-apps
+AlDente
+Calculator off
+Maps stable
+```
+
+A line with only a name turns the compatibility mode on, `off` turns it off and `stable` keeps Liquid Glass with SwiftUI's own controls in the new style. Reload the app afterwards:
+
+```
 /Users/Shared/.devitrify/devitrify-refresh com.apphousekitchen.aldente-pro
 ```
 
-The name is the app's file name without `.app`.
-
-For SwiftUI apps there is an optional second level that also keeps the controls SwiftUI draws classic: write `AlDente compat` instead of `AlDente`. Liquid Glass then runs in its compatibility mode, the way apps built with an older SDK run on macOS 26 and later, and the interface frameworks (AppKit and SwiftUI) are told the app was built with the macOS 15 SDK. Sandboxed apps use a marker file in their container whose content is `compat`:
+Sandboxed apps, which include most apps that come with macOS, can't read that file. They keep a marker file in their own container instead, whose content is `compat`, `stable` or `off`:
 
 ```
-echo compat > ~/Library/Containers/com.apple.calculator/Data/Library/Application\ Support/devitrify-keep-liquid-glass
+echo off > ~/Library/Containers/com.apple.calculator/Data/Library/Application\ Support/devitrify-keep-liquid-glass
 ```
-
-Choosing Help > Keep Liquid Glass again removes the entry, and choosing it once more brings back the standard level, not `compat`. In this mode SwiftUI's pop-up buttons would crash the app when an accessibility client, such as a window manager, looks at them, so Devitrify declares the attribute they are missing. Calculator was checked with an accessibility client reading its whole interface. The mode is opt-in because it has been tried on few apps.
 
 ## How it works
-- `libDevitrify.dylib` is injected into every process through `DYLD_INSERT_LIBRARIES`. It links nothing beyond libSystem and loads `DevitrifyCore.dylib` only into processes that already have AppKit loaded, so command-line tools are unaffected. For apps named in `liquid-glass-apps` (for sandboxed apps: with a marker file in their container), the loader makes the system's feature flag lookup (`_os_feature_enabled_impl`) answer that Liquid Glass is enabled. No environment variable is changed, and the answer holds from the start of the process because dyld applies the interposition when it loads the images.
+- `libDevitrify.dylib` is injected into every process through `DYLD_INSERT_LIBRARIES`. It links nothing beyond libSystem and loads `DevitrifyCore.dylib` only into processes that already have AppKit loaded, so command-line tools are unaffected. For apps that use SwiftUI glass, found in the symbol table of their executable, or that are named in `liquid-glass-apps` (for sandboxed apps: with a marker file in their container), the loader makes the system's feature flag lookup (`_os_feature_enabled_impl`) answer that Liquid Glass is enabled. No environment variable is changed, and the answer holds from the start of the process because dyld applies the interposition when it loads the images.
 - In apps named in `liquid-glass-apps`, AppKit is told that Liquid Glass is off, so their windows, menus and controls are drawn exactly like with Liquid Glass disabled. SwiftUI glass and `NSGlassEffectView` follow SwiftUI's own flag and keep their glass.
 - With Liquid Glass disabled, every `NSGlassEffectView` in an app window gets an `NSVisualEffectView` behind its content, clipped to the glass corner radius. Regular glass uses the popover material and clear glass the HUD material. Glass that fills its window blurs the desktop; glass inside a window blurs the window's content. Glass in AppKit's own windows, such as menus, is left alone because AppKit already draws it correctly.
 - With Liquid Glass enabled, the `glassBackground` and `glassForeground` filters lose their refraction, edge bleed, chromatic aberration and shadow.
@@ -83,6 +86,6 @@ Choosing Help > Keep Liquid Glass again removes the entry, and choosing it once 
 ## Limitations
 - The tint color of `NSGlassEffectView` isn't reproduced.
 - SwiftUI's `.glassEffect()` and `.buttonStyle(.glass)` don't use `NSGlassEffectView`. With Liquid Glass disabled they draw only their content. Devitrify can't turn them into frosted glass directly; keep Liquid Glass for those apps instead.
-- Some apps crash at launch with Liquid Glass disabled, for example FindMy. Keeping Liquid Glass for them through `liquid-glass-apps` doesn't prevent the crash; opening them with `open -a FindMy --env FEATUREFLAGS_ENABLED=SwiftUI/Solarium` does.
+- Some apps crash at launch with Liquid Glass disabled, for example FindMy, which uses SwiftUI glass. Compatibility mode does not prevent the crash; opening it with `open -a FindMy --env FEATUREFLAGS_ENABLED=SwiftUI/Solarium` does.
 - Apps restored at login before the login agent runs start without Devitrify until they are reopened, for example with `devitrify-refresh`.
 - Sandboxed app extensions, such as the panes of System Settings, don't load Devitrify. They don't need it: with Liquid Glass disabled they already draw classic controls.

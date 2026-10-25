@@ -298,10 +298,10 @@ static NSString *dv_keepMarkerPath(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/devitrify-keep-liquid-glass"];
 }
 
+// Whether this app runs with Liquid Glass kept, as the loader decided, whether by the
+// list, the marker or because the app uses SwiftUI's glass effect.
 static BOOL dv_keepsLiquidGlass(void) {
-    if (dv_isSandboxed()) return [NSFileManager.defaultManager fileExistsAtPath:dv_keepMarkerPath()];
-    NSArray *lines = dv_liquidGlassAppsLines();
-    return [lines containsObject:dv_appName()] || [lines containsObject:[dv_appName() stringByAppendingString:@" compat"]];
+    return dv_keepsLiquidGlassViaLoader();
 }
 
 // Whether Liquid Glass is turned off for this app because it is disabled system-wide.
@@ -336,15 +336,14 @@ static void dv_reopenApp(void) {
     BOOL keep = !dv_keepsLiquidGlass();
     if (dv_isSandboxed()) {
         NSString *marker = dv_keepMarkerPath();
-        if (keep) {
-            [NSFileManager.defaultManager createDirectoryAtPath:marker.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
-            if (![@"" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
-        } else if (![NSFileManager.defaultManager removeItemAtPath:marker error:nil]) {
-            return;
-        }
+        [NSFileManager.defaultManager createDirectoryAtPath:marker.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
+        if (![(keep ? @"compat\n" : @"off\n") writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
     } else {
         NSMutableArray<NSString *> *lines = dv_liquidGlassAppsLines();
-        if (keep) [lines addObject:name]; else { [lines removeObject:name]; [lines removeObject:[name stringByAppendingString:@" compat"]]; }
+        for (NSString *line in [lines copy]) {
+            if ([line isEqualToString:name] || [line hasPrefix:[name stringByAppendingString:@" "]]) [lines removeObject:line];
+        }
+        [lines addObject:keep ? name : [name stringByAppendingString:@" off"]];
         NSString *text = [[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
         if (![text writeToFile:dv_liquidGlassAppsPath() atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
     }
