@@ -7,6 +7,12 @@
 #include <dlfcn.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <fcntl.h>
+#include <libkern/OSByteOrder.h>
+#include <mach-o/fat.h>
+#include <mach-o/loader.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,50 +94,105 @@ static bool devitrify_program_sdk_at_least(devitrify_build_version version) {
 DYLD_INTERPOSE(devitrify_program_sdk_version, dyld_get_program_sdk_version);
 DYLD_INTERPOSE(devitrify_program_sdk_at_least, dyld_program_sdk_at_least);
 
+// Whether the app's own executable imports SwiftUI's glass effect, found in the symbol names
+// of its Mach-O file.
+static int executable_uses_glass_effect(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(struct mach_header_64)) { close(fd); return 0; }
+    const uint8_t *base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) return 0;
+
+    int found = 0;
+    const uint8_t *image = base;
+    uint32_t magic = *(const uint32_t *)base;
+    if (magic == FAT_CIGAM) {
+        const struct fat_header *fat = (const struct fat_header *)base;
+        const struct fat_arch *arch = (const struct fat_arch *)(base + sizeof(*fat));
+        image = NULL;
+        for (uint32_t i = 0; i < OSSwapBigToHostInt32(fat->nfat_arch); i++) {
+            if (OSSwapBigToHostInt32(arch[i].cputype) == CPU_TYPE_ARM64) {
+                image = base + OSSwapBigToHostInt32(arch[i].offset);
+                break;
+            }
+        }
+    }
+    if (image && *(const uint32_t *)image == MH_MAGIC_64) {
+        const struct mach_header_64 *header = (const struct mach_header_64 *)image;
+        const struct load_command *command = (const struct load_command *)(header + 1);
+        for (uint32_t i = 0; i < header->ncmds; i++) {
+            if (command->cmd == LC_SYMTAB) {
+                const struct symtab_command *symtab = (const struct symtab_command *)command;
+                const char *strings = (const char *)image + symtab->stroff;
+                found = memmem(strings, symtab->strsize, "11glassEffect", 13) != NULL ||
+                        memmem(strings, symtab->strsize, "GlassEffectContainer", 20) != NULL;
+                break;
+            }
+            command = (const struct load_command *)((const uint8_t *)command + command->cmdsize);
+        }
+    }
+    munmap((void *)base, (size_t)st.st_size);
+    return found;
+}
+
+// Each source of a decision is "on" (compatibility mode), "stable", "off" or absent.
+enum { CHOICE_NONE, CHOICE_COMPAT, CHOICE_STABLE, CHOICE_OFF };
+
+static int choice_from_text(const char *text) {
+    if (!strncmp(text, "off", 3)) return CHOICE_OFF;
+    if (!strncmp(text, "stable", 6)) return CHOICE_STABLE;
+    return CHOICE_COMPAT;
+}
+
 static void keep_liquid_glass_if_listed(const char *dir) {
     char executable[PATH_MAX];
     uint32_t size = sizeof(executable);
     if (_NSGetExecutablePath(executable, &size) != 0 || !strstr(executable, ".app/Contents/MacOS/")) return;
 
-    // Sandboxed apps can't read liquid-glass-apps. Their HOME is their container, where
-    // Help > Keep Liquid Glass leaves a marker file.
+    int choice = CHOICE_NONE;
     const char *home = getenv("HOME");
     if (home && strstr(home, "/Library/Containers/")) {
+        // Sandboxed apps can't read liquid-glass-apps. Their HOME is their container, where
+        // Help > Keep Liquid Glass leaves a marker file.
         char marker[PATH_MAX];
         snprintf(marker, sizeof(marker), "%s/Library/Application Support/devitrify-keep-liquid-glass", home);
         FILE *file = fopen(marker, "r");
         if (file) {
-            char mode[16] = "";
-            if (fgets(mode, sizeof(mode), file) && !strncmp(mode, "compat", 6)) s_compatibility_mode = 1;
-            s_keep_liquid_glass = 1;
+            char text[16] = "";
+            if (!fgets(text, sizeof(text), file)) text[0] = '\0';
+            choice = choice_from_text(text);
             fclose(file);
         }
-        return;
-    }
-
-    char list[PATH_MAX];
-    snprintf(list, sizeof(list), "%s/liquid-glass-apps", dir);
-    FILE *file = fopen(list, "r");
-    if (!file) return;
-
-    char line[256];
-    while (fgets(line, sizeof(line), file)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (line[0] == '\0' || line[0] == '#') continue;
-        int compat = 0;
-        size_t length = strlen(line);
-        if (length > 7 && !strcmp(line + length - 7, " compat")) {
-            compat = 1;
-            line[length - 7] = '\0';
+    } else {
+        char list[PATH_MAX];
+        snprintf(list, sizeof(list), "%s/liquid-glass-apps", dir);
+        FILE *file = fopen(list, "r");
+        char line[256];
+        while (file && fgets(line, sizeof(line), file)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (line[0] == '\0' || line[0] == '#') continue;
+            char *space = strchr(line, ' ');
+            const char *option = "";
+            if (space) {
+                *space = '\0';
+                option = space + 1;
+            }
+            char needle[PATH_MAX];
+            snprintf(needle, sizeof(needle), "/%s.app/Contents/MacOS/", line);
+            if (!strstr(executable, needle)) continue;
+            choice = choice_from_text(option);
+            break;
         }
-        char needle[PATH_MAX];
-        snprintf(needle, sizeof(needle), "/%s.app/Contents/MacOS/", line);
-        if (!strstr(executable, needle)) continue;
-        s_keep_liquid_glass = 1;
-        s_compatibility_mode = compat;
-        break;
+        if (file) fclose(file);
     }
-    fclose(file);
+
+    // Without a choice, apps that use SwiftUI's glass effect get the compatibility mode.
+    if (choice == CHOICE_NONE && executable_uses_glass_effect(executable)) choice = CHOICE_COMPAT;
+
+    if (choice == CHOICE_COMPAT || choice == CHOICE_STABLE) s_keep_liquid_glass = 1;
+    if (choice == CHOICE_COMPAT) s_compatibility_mode = 1;
 }
 
 __attribute__((constructor))
