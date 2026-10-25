@@ -276,11 +276,24 @@ static NSMutableArray<NSString *> *dv_liquidGlassAppsLines(void) {
     return lines;
 }
 
-static BOOL dv_liquidGlassDisabledSystemWide(void) {
-    NSDictionary *flags = [NSDictionary dictionaryWithContentsOfFile:@"/Library/Preferences/FeatureFlags/Domain/SwiftUI.plist"];
-    id enabled = flags[@"Solarium"][@"Enabled"];
-    return enabled && ![enabled boolValue];
+// Sandboxed apps can't read liquid-glass-apps. They keep a marker file in their own
+// container instead, which the app can read and write itself.
+static BOOL dv_isSandboxed(void) {
+    return [NSHomeDirectory() containsString:@"/Library/Containers/"];
 }
+
+static NSString *dv_keepMarkerPath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/devitrify-keep-liquid-glass"];
+}
+
+static BOOL dv_keepsLiquidGlass(void) {
+    if (dv_isSandboxed()) return [NSFileManager.defaultManager fileExistsAtPath:dv_keepMarkerPath()];
+    return [dv_liquidGlassAppsLines() containsObject:dv_appName()];
+}
+
+// Whether Liquid Glass is turned off for this app because it is disabled system-wide.
+// Evaluated before Devitrify enables it for apps that keep it.
+static BOOL s_liquidGlassOffSystemWide = NO;
 
 // Reopens the app once it has quit. If quitting is cancelled, for example to keep unsaved
 // changes, it gives up after a minute instead of reopening the app later by surprise.
@@ -300,18 +313,28 @@ static void dv_reopenApp(void) {
 @implementation DVKeepLiquidGlassItemTarget
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
-    item.state = [dv_liquidGlassAppsLines() containsObject:dv_appName()] ? NSControlStateValueOn : NSControlStateValueOff;
+    item.state = dv_keepsLiquidGlass() ? NSControlStateValueOn : NSControlStateValueOff;
     return YES;
 }
 
 - (void)toggleKeepLiquidGlass:(NSMenuItem *)item {
     (void)item;
     NSString *name = dv_appName();
-    NSMutableArray<NSString *> *lines = dv_liquidGlassAppsLines();
-    BOOL keep = ![lines containsObject:name];
-    if (keep) [lines addObject:name]; else [lines removeObject:name];
-    NSString *text = [[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
-    if (![text writeToFile:dv_liquidGlassAppsPath() atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
+    BOOL keep = !dv_keepsLiquidGlass();
+    if (dv_isSandboxed()) {
+        NSString *marker = dv_keepMarkerPath();
+        if (keep) {
+            [NSFileManager.defaultManager createDirectoryAtPath:marker.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
+            if (![@"" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
+        } else if (![NSFileManager.defaultManager removeItemAtPath:marker error:nil]) {
+            return;
+        }
+    } else {
+        NSMutableArray<NSString *> *lines = dv_liquidGlassAppsLines();
+        if (keep) [lines addObject:name]; else [lines removeObject:name];
+        NSString *text = [[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+        if (![text writeToFile:dv_liquidGlassAppsPath() atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
+    }
 
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = [NSString stringWithFormat:keep ? @"%@ will keep Liquid Glass." : @"%@ will no longer keep Liquid Glass.", name];
@@ -324,9 +347,11 @@ static void dv_reopenApp(void) {
 @end
 
 static void dv_installKeepLiquidGlassItem(void) {
-    if (!dv_liquidGlassDisabledSystemWide()) return;
-    NSString *path = dv_liquidGlassAppsPath();
-    if (!path || ![NSFileManager.defaultManager isWritableFileAtPath:path.stringByDeletingLastPathComponent]) return;
+    if (!s_liquidGlassOffSystemWide) return;
+    if (!dv_isSandboxed()) {
+        NSString *path = dv_liquidGlassAppsPath();
+        if (!path || ![NSFileManager.defaultManager isWritableFileAtPath:path.stringByDeletingLastPathComponent]) return;
+    }
     if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) return;
 
     static DVKeepLiquidGlassItemTarget *target;
@@ -351,6 +376,7 @@ static void dv_installKeepLiquidGlassItem(void) {
 __attribute__((constructor))
 static void DevitrifyInit(void) {
     @autoreleasepool {
+        s_liquidGlassOffSystemWide = getenv("DEVITRIFY_LIQUID_GLASS_APP") || !_os_feature_enabled_impl("SwiftUI", "Solarium");
         if (_os_feature_enabled_impl("SwiftUI", "Solarium")) {
             dv_installGlassFilterNeutralization();
             if (getenv("DEVITRIFY_LIQUID_GLASS_APP")) dv_installClassicAppKit();
