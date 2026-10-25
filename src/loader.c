@@ -99,7 +99,13 @@ static void keep_liquid_glass_if_listed(const char *dir) {
     if (home && strstr(home, "/Library/Containers/")) {
         char marker[PATH_MAX];
         snprintf(marker, sizeof(marker), "%s/Library/Application Support/devitrify-keep-liquid-glass", home);
-        if (access(marker, F_OK) == 0) s_keep_liquid_glass = 1;
+        FILE *file = fopen(marker, "r");
+        if (file) {
+            char mode[16] = "";
+            if (fgets(mode, sizeof(mode), file) && !strncmp(mode, "compat", 6)) s_compatibility_mode = 1;
+            s_keep_liquid_glass = 1;
+            fclose(file);
+        }
         return;
     }
 

@@ -66,9 +66,13 @@ echo AlDente >> /Users/Shared/.devitrify/liquid-glass-apps
 
 The name is the app's file name without `.app`.
 
-For SwiftUI apps there is an optional second level that also keeps the controls SwiftUI draws classic: write `AlDente compat` instead of `AlDente`. Liquid Glass then runs in its compatibility mode, the way apps built with an older SDK run on macOS 26 and later, and the interface frameworks (AppKit and SwiftUI) are told the app was built with the macOS 15 SDK. It is opt-in because some SwiftUI controls, such as pop-up menus, throw an exception in this mode when an accessibility client is running, which crashes the app. Calculator is an example.
+For SwiftUI apps there is an optional second level that also keeps the controls SwiftUI draws classic: write `AlDente compat` instead of `AlDente`. Liquid Glass then runs in its compatibility mode, the way apps built with an older SDK run on macOS 26 and later, and the interface frameworks (AppKit and SwiftUI) are told the app was built with the macOS 15 SDK. Sandboxed apps use a marker file in their container whose content is `compat`:
 
- The app's windows, menus and AppKit controls stay classic like the rest of the system; buttons and pickers that SwiftUI draws itself follow Liquid Glass.
+```
+echo compat > ~/Library/Containers/com.apple.calculator/Data/Library/Application\ Support/devitrify-keep-liquid-glass
+```
+
+Choosing Help > Keep Liquid Glass again removes the entry, and choosing it once more brings back the standard level, not `compat`. In this mode SwiftUI's pop-up buttons would crash the app when an accessibility client, such as a window manager, looks at them, so Devitrify declares the attribute they are missing. Calculator was checked with an accessibility client reading its whole interface. The mode is opt-in because it has been tried on few apps.
 
 ## How it works
 - `libDevitrify.dylib` is injected into every process through `DYLD_INSERT_LIBRARIES`. It links nothing beyond libSystem and loads `DevitrifyCore.dylib` only into processes that already have AppKit loaded, so command-line tools are unaffected. For apps named in `liquid-glass-apps` (for sandboxed apps: with a marker file in their container), the loader makes the system's feature flag lookup (`_os_feature_enabled_impl`) answer that Liquid Glass is enabled. No environment variable is changed, and the answer holds from the start of the process because dyld applies the interposition when it loads the images.

@@ -17,6 +17,7 @@ static BOOL dv_compatibilityModeViaLoader(void) {
     return compat && compat();
 }
 
+static BOOL dv_compatibilityModeViaLoader(void);
 static BOOL dv_keepsLiquidGlassViaLoader(void) {
     int (*keeps)(void) = dlsym(RTLD_DEFAULT, "devitrify_keeps_liquid_glass");
     return keeps && keeps();
@@ -398,6 +399,25 @@ static void dv_installKeepLiquidGlassItem(void) {
     }
 }
 
+#pragma mark - Compatibility mode: accessibility of pop-up buttons
+
+// In compatibility mode SwiftUI's pop-up buttons are NSPopUpButtonCell subclasses that don't
+// declare the AXSubrole attribute, and SwiftUI's accessibility code asks for it anyway. AppKit
+// throws for attributes that are not declared, which crashes the app as soon as an
+// accessibility client, such as a window manager, looks at the window. Declare it, and the
+// default answer for an attribute without a value applies.
+static IMP s_orig_cell_attributeNames = NULL;
+static NSArray *swizzled_cell_attributeNames(id self, SEL _cmd) {
+    NSArray *names = ((NSArray *(*)(id, SEL))s_orig_cell_attributeNames)(self, _cmd);
+    if (names && ![names containsObject:NSAccessibilitySubroleAttribute]) names = [names arrayByAddingObject:NSAccessibilitySubroleAttribute];
+    return names;
+}
+
+static void dv_installCompatibilityAccessibilityFix(void) {
+    Class cls = NSClassFromString(@"NSPopUpButtonCell");
+    dv_swizzle(cls, @selector(accessibilityAttributeNames), (IMP)swizzled_cell_attributeNames, &s_orig_cell_attributeNames);
+}
+
 __attribute__((constructor))
 static void DevitrifyInit(void) {
     @autoreleasepool {
@@ -405,6 +425,7 @@ static void DevitrifyInit(void) {
         if (_os_feature_enabled_impl("SwiftUI", "Solarium")) {
             dv_installGlassFilterNeutralization();
             if (dv_keepsLiquidGlassViaLoader() && !dv_compatibilityModeViaLoader()) dv_installClassicAppKit();
+            if (dv_compatibilityModeViaLoader()) dv_installCompatibilityAccessibilityFix();
         } else {
             dv_installFrostedGlassFallback();
         }
