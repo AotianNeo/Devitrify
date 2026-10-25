@@ -1,8 +1,10 @@
 #!/bin/sh
-# Quits and reopens running apps that were started before Devitrify was loaded, so they
-# pick it up. Usage: devitrify-refresh [-n] [bundle-id ...]
-#   -n          only list the apps that would be reopened
-#   bundle-id   only consider these apps
+# Reloads running apps and services that were started before Devitrify was loaded, so they
+# pick it up: apps are quit and reopened, launchd services are restarted by launchd.
+# Usage: devitrify-refresh [-n] [bundle-id ...]
+#   -n          only list what would be reloaded
+#   bundle-id   only consider these apps and services, and reload them even if they
+#               already have Devitrify loaded (e.g. after editing liquid-glass-apps)
 
 LOADER=/Users/Shared/.devitrify/libDevitrify.dylib
 FEATURE_FLAGS=/Library/Preferences/FeatureFlags/Domain/SwiftUI.plist
@@ -22,14 +24,16 @@ has_devitrify() {
     ps -ww -E -o command= -p "$1" 2>/dev/null | grep -q "DYLD_INSERT_LIBRARIES=$LOADER"
 }
 
-printf "Looking for apps that were started before Devitrify was loaded...\n"
+printf "Looking for apps and services that were started before Devitrify was loaded...\n"
 
 # With Liquid Glass disabled, Devitrify only changes NSGlassEffectView, so apps that don't
-# use it in their executable or bundled frameworks gain nothing from being reopened.
+# use it in their executable or bundled frameworks gain nothing from being reloaded.
+# System apps and services use it from system frameworks, which can't be scanned.
 liquid_glass_disabled=0
 defaults read "$FEATURE_FLAGS" Solarium 2>/dev/null | grep -q "Enabled = 0" && liquid_glass_disabled=1
 
 uses_glass_view() {
+    case "$1" in /System/Library/*) return 0 ;; esac
     executable=$(defaults read "$1/Contents/Info" CFBundleExecutable 2>/dev/null) || return 1
     LC_ALL=C grep -q -a -F NSGlassEffectView "$1/Contents/MacOS/$executable" 2>/dev/null && return 0
     [ -d "$1/Contents/Frameworks" ] || return 1
@@ -44,7 +48,7 @@ while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
     pid=$(ps -o ppid= -p "$pid" | tr -d ' ')
 done
 
-# Running apps, menu bar apps included, as "pid<TAB>bundle id<TAB>bundle path<TAB>name".
+# Running apps, menu bar apps and system UI included, as "pid<TAB>bundle id<TAB>bundle path<TAB>name".
 running_apps=$(osascript -l JavaScript -e '
     ObjC.import("AppKit");
     $.NSWorkspace.sharedWorkspace.runningApplications.js
@@ -54,68 +58,77 @@ running_apps=$(osascript -l JavaScript -e '
         .join("\n");
 ')
 
-apps_to_reopen() {
+# How launchd started each process in this session: apps opened through LaunchServices
+# have "application.*" labels, services have the label of their launchd job. Processes
+# missing from the list, such as loginwindow, are never touched.
+launchd_jobs=$(launchctl list)
+launchd_label() {
+    printf '%s\n' "$launchd_jobs" | awk -v pid="$1" '$1 == pid { print $3 }'
+}
+
+# Prints "pid<TAB>bundle id<TAB>bundle path<TAB>name<TAB>launchd label" for everything to reload.
+to_reload() {
     printf '%s\n' "$running_apps" | while IFS="$(printf '\t')" read -r pid bundle_id path name; do
         [ -n "$pid" ] || continue
-        # Only standalone apps: no helpers or extensions nested in another bundle, and no
-        # system UI under /System/Library, which launchd manages.
+        # Only standalone apps, not helpers or extensions nested in another bundle.
         case "$path" in *.app) ;; *) continue ;; esac
         case "${path%/*}/" in *.app/*) continue ;; esac
-        case "$path" in /System/Library/*) continue ;; esac
         case "$ancestors" in *" $pid "*) continue ;; esac
         if [ $# -gt 0 ]; then
             case " $* " in *" $bundle_id "*) ;; *) continue ;; esac
         fi
-        has_devitrify "$pid" && continue
-        [ "$liquid_glass_disabled" -eq 1 ] && ! uses_glass_view "$path" && continue
-        printf '%s\t%s\t%s\t%s\n' "$pid" "$bundle_id" "$path" "$name"
+        label=$(launchd_label "$pid")
+        [ -n "$label" ] || continue
+        if [ $# -eq 0 ]; then
+            has_devitrify "$pid" && continue
+            [ "$liquid_glass_disabled" -eq 1 ] && ! uses_glass_view "$path" && continue
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$bundle_id" "$path" "$name" "$label"
     done
 }
-targets=$(apps_to_reopen "$@")
+reload=$(to_reload "$@")
+apps=$(printf '%s\n' "$reload" | awk -F '\t' 'NF && $5 ~ /^application\./')
+services=$(printf '%s\n' "$reload" | awk -F '\t' 'NF && $5 !~ /^application\./')
 
-# Control Center and Notification Center are launchd agents, relaunched by launchd itself.
-agents=""
-for label in com.apple.controlcenter com.apple.notificationcenterui.agent; do
-    pid=$(launchctl list | awk -v label="$label" '$3 == label { print $1 }')
-    if [ -n "$pid" ] && [ "$pid" != "-" ] && ! has_devitrify "$pid"; then
-        agents="$agents $label"
-    fi
-done
-[ $# -gt 0 ] && agents=""
-
-if [ -z "$targets" ] && [ -z "$agents" ]; then
-    printf "All running apps already have Devitrify loaded.\n"
+if [ -z "$apps" ] && [ -z "$services" ]; then
+    printf "Nothing to reload.\n"
     exit 0
 fi
 
-printf "These apps were started before Devitrify was loaded:\n"
-printf '%s\n' "$targets" | while IFS="$(printf '\t')" read -r pid bundle_id path name; do
-    [ -n "$pid" ] && printf '    %s\n' "$name"
-done
-for label in $agents; do
-    case "$label" in
-        com.apple.controlcenter) printf '    Control Center\n' ;;
-        *) printf '    Notification Center\n' ;;
-    esac
-done
+if [ -n "$apps" ]; then
+    printf "These apps can be reloaded:\n"
+    printf '%s\n' "$apps" | awk -F '\t' '{ print "    " $4 }'
+fi
+if [ -n "$services" ]; then
+    printf "These services can be reloaded:\n"
+    printf '%s\n' "$services" | awk -F '\t' '{ print "    " $4 }'
+fi
 [ "$dry_run" -eq 1 ] && exit 0
 
-read -r -p "Quit and reopen them now? [Y/n] " response </dev/tty || exit 0
+if [ -n "$services" ]; then
+    read -r -p "Restart these services now? Their menus and windows go away for a moment. [Y/n] " response </dev/tty || exit 0
+    case "$response" in
+        [nN][oO]|[nN]) ;;
+        *)
+            printf '%s\n' "$services" | while IFS="$(printf '\t')" read -r pid bundle_id path name label; do
+                launchctl kickstart -k "gui/$(id -u)/$label" && printf 'Restarted %s.\n' "$name"
+            done
+            ;;
+    esac
+fi
+
+[ -n "$apps" ] || exit 0
+read -r -p "Quit and reopen these apps now? [Y/n] " response </dev/tty || exit 0
 case "$response" in
     [nN][oO]|[nN]) exit 0 ;;
 esac
 
-for label in $agents; do
-    launchctl kickstart -k "gui/$(id -u)/$label"
-done
-
 # Ask every app to quit the normal way, so they save their state and restore their windows.
-printf '%s\n' "$targets" | while IFS="$(printf '\t')" read -r pid bundle_id path name; do
-    [ -n "$pid" ] && osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSRunningApplication.runningApplicationWithProcessIdentifier($pid).terminate" > /dev/null
+printf '%s\n' "$apps" | while IFS="$(printf '\t')" read -r pid bundle_id path name label; do
+    osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSRunningApplication.runningApplicationWithProcessIdentifier($pid).terminate" > /dev/null
 done
 
-printf '%s\n' "$targets" | while IFS="$(printf '\t')" read -r pid bundle_id path name; do
-    [ -n "$pid" ] || continue
+printf '%s\n' "$apps" | while IFS="$(printf '\t')" read -r pid bundle_id path name label; do
     waited=0
     while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 20 ]; do
         sleep 1

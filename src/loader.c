@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,16 +19,53 @@ static int appkit_is_loaded(void) {
     return 0;
 }
 
+// Apps named in liquid-glass-apps (one app name per line, e.g. "AlDente") keep Liquid
+// Glass while it is disabled system-wide, so their SwiftUI glass keeps its shape and
+// DevitrifyCore turns it into frosted glass. This runs before AppKit and SwiftUI read
+// the feature flag.
+static void keep_liquid_glass_if_listed(const char *dir) {
+    char executable[PATH_MAX];
+    uint32_t size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &size) != 0 || !strstr(executable, ".app/Contents/MacOS/")) return;
+
+    char list[PATH_MAX];
+    snprintf(list, sizeof(list), "%s/liquid-glass-apps", dir);
+    FILE *file = fopen(list, "r");
+    if (!file) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0' || line[0] == '#') continue;
+        char needle[PATH_MAX];
+        snprintf(needle, sizeof(needle), "/%s.app/Contents/MacOS/", line);
+        if (!strstr(executable, needle)) continue;
+
+        const char *enabled = getenv("FEATUREFLAGS_ENABLED");
+        if (!enabled || !*enabled) {
+            setenv("FEATUREFLAGS_ENABLED", "SwiftUI/Solarium", 1);
+        } else if (!strstr(enabled, "SwiftUI/Solarium")) {
+            char value[1024];
+            snprintf(value, sizeof(value), "%s:SwiftUI/Solarium", enabled);
+            setenv("FEATUREFLAGS_ENABLED", value, 1);
+        }
+        break;
+    }
+    fclose(file);
+}
+
 __attribute__((constructor))
 static void devitrify_load_core(void) {
-    if (!appkit_is_loaded()) return;
-
     Dl_info info;
     char path[PATH_MAX];
     if (!dladdr((const void *)devitrify_load_core, &info) || !realpath(info.dli_fname, path)) return;
 
     char *slash = strrchr(path, '/');
     if (!slash) return;
-    strlcpy(slash + 1, "DevitrifyCore.dylib", sizeof(path) - (size_t)(slash + 1 - path));
+    *slash = '\0';
+    keep_liquid_glass_if_listed(path);
+
+    if (!appkit_is_loaded()) return;
+    strlcat(path, "/DevitrifyCore.dylib", sizeof(path));
     dlopen(path, RTLD_NOW | RTLD_LOCAL);
 }

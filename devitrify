@@ -132,6 +132,10 @@ for script in devitrify-agent devitrify-refresh; do
     chmod +x "$INSTALL_DIR/$script"
 done
 
+if [ ! -f "$INSTALL_DIR/liquid-glass-apps" ]; then
+    printf '# Apps that keep Liquid Glass while it is disabled, frosted by Devitrify.\n# One app name per line, for example: AlDente\n' > "$INSTALL_DIR/liquid-glass-apps"
+fi
+
 printf 'Loading Devitrify into apps...\n'
 xattr -c ./assets/com.devitrify.agent.plist
 mkdir -p ~/Library/LaunchAgents

@@ -46,21 +46,31 @@ launchctl kickstart -k gui/$(id -u)/com.apple.notificationcenterui.agent
 ```
 
 ## Tip: Reload apps that are already running
-Apps only load Devitrify when they launch. To quit and reopen the running apps that were started before Devitrify was loaded, for example windows restored at login, open Terminal and run the following command. It lists the apps first and asks before quitting them. With Liquid Glass disabled, it only picks apps that use `NSGlassEffectView`, because nothing changes for the others.
+Apps and services only load Devitrify when they launch. To reload the ones that were started before Devitrify was loaded, for example windows restored at login, open Terminal and run the following command. It lists them first and asks before quitting and reopening the apps and before letting launchd restart the services, such as Finder and SystemUIServer. With Liquid Glass disabled, it only picks apps that use `NSGlassEffectView`, because nothing changes for the others. Services under `/System/Library` are always listed, because they use glass from system frameworks that can't be checked.
 
 ```
 /Users/Shared/.devitrify/devitrify-refresh
 ```
 
-Add `-n` to only list the apps, or bundle identifiers such as `com.apple.Music` to only consider those apps.
+Add `-n` to only list them. Add bundle identifiers such as `com.apple.Music` to reload only those apps, even if they already have Devitrify loaded.
+
+## Tip: Keep Liquid Glass for specific apps
+Apps built with SwiftUI's `.glassEffect()` lose their glass shapes when Liquid Glass is disabled, for example Calculator's keys or AlDente's menu. To let such an app keep Liquid Glass, which Devitrify then turns into frosted glass, add its name to `/Users/Shared/.devitrify/liquid-glass-apps` and reload it:
+
+```
+echo AlDente >> /Users/Shared/.devitrify/liquid-glass-apps
+/Users/Shared/.devitrify/devitrify-refresh com.apphousekitchen.aldente-pro
+```
+
+The name is the app's file name without `.app`. The app's controls follow Liquid Glass too.
 
 ## How it works
-- `libDevitrify.dylib` is injected into every process through `DYLD_INSERT_LIBRARIES`. It links nothing beyond libSystem and loads `DevitrifyCore.dylib` only into processes that already have AppKit loaded, so command-line tools are unaffected.
+- `libDevitrify.dylib` is injected into every process through `DYLD_INSERT_LIBRARIES`. It links nothing beyond libSystem and loads `DevitrifyCore.dylib` only into processes that already have AppKit loaded, so command-line tools are unaffected. For apps named in `liquid-glass-apps`, it first sets `FEATUREFLAGS_ENABLED=SwiftUI/Solarium`, before AppKit and SwiftUI read the feature flag.
 - With Liquid Glass disabled, every `NSGlassEffectView` in an app window gets an `NSVisualEffectView` behind its content, clipped to the glass corner radius. Regular glass uses the popover material and clear glass the HUD material. Glass that fills its window blurs the desktop; glass inside a window blurs the window's content. Glass in AppKit's own windows, such as menus, is left alone because AppKit already draws it correctly.
 - With Liquid Glass enabled, the `glassBackground` and `glassForeground` filters lose their refraction, edge bleed, chromatic aberration and shadow.
 
 ## Limitations
 - The tint color of `NSGlassEffectView` isn't reproduced.
-- SwiftUI's `.glassEffect()` and `.buttonStyle(.glass)` don't use `NSGlassEffectView`. With Liquid Glass disabled they draw only their content, for example Calculator's keys lose their round backgrounds. Devitrify doesn't change them.
+- SwiftUI's `.glassEffect()` and `.buttonStyle(.glass)` don't use `NSGlassEffectView`. With Liquid Glass disabled they draw only their content. Devitrify can't turn them into frosted glass directly; keep Liquid Glass for those apps instead.
 - Apps restored at login before the login agent runs start without Devitrify until they are reopened, for example with `devitrify-refresh`.
 - Sandboxed app extensions, such as the panes of System Settings, don't load Devitrify. They don't need it: with Liquid Glass disabled they already draw classic controls.

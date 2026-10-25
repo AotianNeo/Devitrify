@@ -26,8 +26,9 @@ extern bool _os_feature_enabled_impl(const char *domain, const char *feature);
 //     and rely on its real implementation.
 //
 //  2. Liquid Glass ON (system-wide, or per process through
-//     FEATUREFLAGS_ENABLED=SwiftUI/Solarium, e.g. Control Center and Notification
-//     Center under launchbad-revived): refraction, bleed, aberration and shadow are
+//     FEATUREFLAGS_ENABLED=SwiftUI/Solarium: Control Center and Notification Center
+//     under launchbad-revived, and apps named in liquid-glass-apps, see loader.c):
+//     refraction, bleed, aberration and shadow are
 //     stripped from the glassBackground and glassForeground filters, leaving a plain
 //     Gaussian blur.
 // ============================================================================
@@ -68,14 +69,15 @@ static const void *kDVBackdropKey = &kDVBackdropKey;
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return NO; }
 @end
 
-// AppKit builds menus and other system chrome out of NSGlassEffectView too and draws
-// them correctly by itself. Only glass in windows of the app's own classes (or plain
-// NSWindow / NSPanel) gets a backdrop.
+// AppKit and other system frameworks build menus and similar chrome out of
+// NSGlassEffectView too and draw them correctly by themselves. Only glass in windows
+// of an app's own classes (system apps included) or plain NSWindow / NSPanel gets a
+// backdrop.
 static BOOL dv_isAppWindow(NSWindow *window) {
     if (!window) return NO;
     for (Class cls = object_getClass(window); cls && cls != [NSPanel class] && cls != [NSWindow class]; cls = class_getSuperclass(cls)) {
         const char *image = class_getImageName(cls);
-        if (image && strstr(image, "/System/Library/")) return NO;
+        if (image && strstr(image, "/System/Library/") && strstr(image, ".framework/")) return NO;
     }
     return YES;
 }
