@@ -399,13 +399,64 @@ static void dv_installKeepLiquidGlassItem(void) {
     }
 }
 
-#pragma mark - Compatibility mode: accessibility of pop-up buttons
+#pragma mark - Compatibility mode: accessibility protection
 
-// In compatibility mode SwiftUI's pop-up buttons are NSPopUpButtonCell subclasses that don't
-// declare the AXSubrole attribute, and SwiftUI's accessibility code asks for it anyway. AppKit
-// throws for attributes that are not declared, which crashes the app as soon as an
-// accessibility client, such as a window manager, looks at the window. Declare it, and the
-// default answer for an attribute without a value applies.
+// In compatibility mode (and older SDK emulation), SwiftUI asks legacy AppKit controls
+// for attributes like AXSubrole, AXIsElement, etc. that older AppKit implementations
+// don't declare. AppKit throws NSAccessibilityException for undeclared attributes,
+// crashing the app as soon as an accessibility client (window manager, screen capture,
+// System Events) inspects the window hierarchy.
+//
+// We catch and suppress NSAccessibilityException on accessibilityAttributeValue: for
+// NSView, NSWindow, and NSCell (returning nil instead of uncaught exception),
+// as well as interposing the C entry point NSAccessibilityAttributeValue.
+#define DYLD_INTERPOSE(replacement, replacee) \
+    __attribute__((used)) static struct { const void *replacement; const void *replacee; } _interpose_##replacee \
+    __attribute__((section("__DATA,__interpose"))) = { (const void *)(unsigned long)&replacement, (const void *)(unsigned long)&replacee }
+
+extern id NSAccessibilityAttributeValue(id element, NSString *attribute);
+
+static id devitrify_NSAccessibilityAttributeValue(id element, NSString *attribute) {
+    @try {
+        return NSAccessibilityAttributeValue(element, attribute);
+    } @catch (NSException *ex) {
+        if ([ex.name isEqualToString:@"NSAccessibilityException"]) return nil;
+        @throw;
+    }
+}
+
+DYLD_INTERPOSE(devitrify_NSAccessibilityAttributeValue, NSAccessibilityAttributeValue);
+
+static IMP s_orig_view_attr_value = NULL;
+static id swizzled_view_attributeValue(id self, SEL _cmd, NSString *attribute) {
+    @try {
+        return ((id (*)(id, SEL, NSString *))s_orig_view_attr_value)(self, _cmd, attribute);
+    } @catch (NSException *ex) {
+        if ([ex.name isEqualToString:@"NSAccessibilityException"]) return nil;
+        @throw;
+    }
+}
+
+static IMP s_orig_win_attr_value = NULL;
+static id swizzled_win_attributeValue(id self, SEL _cmd, NSString *attribute) {
+    @try {
+        return ((id (*)(id, SEL, NSString *))s_orig_win_attr_value)(self, _cmd, attribute);
+    } @catch (NSException *ex) {
+        if ([ex.name isEqualToString:@"NSAccessibilityException"]) return nil;
+        @throw;
+    }
+}
+
+static IMP s_orig_cell_attr_value = NULL;
+static id swizzled_cell_attributeValue(id self, SEL _cmd, NSString *attribute) {
+    @try {
+        return ((id (*)(id, SEL, NSString *))s_orig_cell_attr_value)(self, _cmd, attribute);
+    } @catch (NSException *ex) {
+        if ([ex.name isEqualToString:@"NSAccessibilityException"]) return nil;
+        @throw;
+    }
+}
+
 static IMP s_orig_cell_attributeNames = NULL;
 static NSArray *swizzled_cell_attributeNames(id self, SEL _cmd) {
     NSArray *names = ((NSArray *(*)(id, SEL))s_orig_cell_attributeNames)(self, _cmd);
@@ -414,8 +465,11 @@ static NSArray *swizzled_cell_attributeNames(id self, SEL _cmd) {
 }
 
 static void dv_installCompatibilityAccessibilityFix(void) {
+    dv_swizzle([NSView class], @selector(accessibilityAttributeValue:), (IMP)swizzled_view_attributeValue, &s_orig_view_attr_value);
+    dv_swizzle([NSWindow class], @selector(accessibilityAttributeValue:), (IMP)swizzled_win_attributeValue, &s_orig_win_attr_value);
+    dv_swizzle([NSCell class], @selector(accessibilityAttributeValue:), (IMP)swizzled_cell_attributeValue, &s_orig_cell_attr_value);
     Class cls = NSClassFromString(@"NSPopUpButtonCell");
-    dv_swizzle(cls, @selector(accessibilityAttributeNames), (IMP)swizzled_cell_attributeNames, &s_orig_cell_attributeNames);
+    if (cls) dv_swizzle(cls, @selector(accessibilityAttributeNames), (IMP)swizzled_cell_attributeNames, &s_orig_cell_attributeNames);
 }
 
 __attribute__((constructor))
