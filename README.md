@@ -57,11 +57,11 @@ Add `-n` to only list them. Add bundle identifiers such as `com.apple.Music` to 
 ## Tip: Keep Liquid Glass for specific apps
 Apps built with SwiftUI's `.glassEffect()` lose their glass shapes when Liquid Glass is disabled, for example Calculator's keys or AlDente's menu. Such an app can keep Liquid Glass, which Devitrify then turns into frosted glass: choose Help > Keep Liquid Glass in the app and let it reopen.
 
-Menu bar apps such as AlDente have no visible Help menu. Add their name to `/Users/Shared/.devitrify/liquid-glass-apps` and reload them instead:
+The Help menu item is missing in sandboxed apps, which include most apps that come with macOS such as Calculator, and in menu bar apps such as AlDente. Add their name to `/Users/Shared/.devitrify/liquid-glass-apps` and reload them instead:
 
 ```
-echo AlDente >> /Users/Shared/.devitrify/liquid-glass-apps
-/Users/Shared/.devitrify/devitrify-refresh com.apphousekitchen.aldente-pro
+echo Calculator >> /Users/Shared/.devitrify/liquid-glass-apps
+/Users/Shared/.devitrify/devitrify-refresh com.apple.calculator
 ```
 
 The name is the app's file name without `.app`. The app's windows, menus and AppKit controls stay classic like the rest of the system; buttons and pickers that SwiftUI draws itself follow Liquid Glass.
