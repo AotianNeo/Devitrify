@@ -11,6 +11,12 @@
 
 extern bool _os_feature_enabled_impl(const char *domain, const char *feature);
 
+// libDevitrify.dylib (the loader) knows whether this app keeps Liquid Glass.
+static BOOL dv_keepsLiquidGlassViaLoader(void) {
+    int (*keeps)(void) = dlsym(RTLD_DEFAULT, "devitrify_keeps_liquid_glass");
+    return keeps && keeps();
+}
+
 // ============================================================================
 //  Devitrify
 //
@@ -389,10 +395,10 @@ static void dv_installKeepLiquidGlassItem(void) {
 __attribute__((constructor))
 static void DevitrifyInit(void) {
     @autoreleasepool {
-        s_liquidGlassOffSystemWide = getenv("DEVITRIFY_LIQUID_GLASS_APP") || !_os_feature_enabled_impl("SwiftUI", "Solarium");
+        s_liquidGlassOffSystemWide = dv_keepsLiquidGlassViaLoader() || !_os_feature_enabled_impl("SwiftUI", "Solarium");
         if (_os_feature_enabled_impl("SwiftUI", "Solarium")) {
             dv_installGlassFilterNeutralization();
-            if (getenv("DEVITRIFY_LIQUID_GLASS_APP")) dv_installClassicAppKit();
+            if (dv_keepsLiquidGlassViaLoader()) dv_installClassicAppKit();
         } else {
             dv_installFrostedGlassFallback();
         }

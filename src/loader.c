@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,20 +24,28 @@ static int appkit_is_loaded(void) {
 
 // Apps named in liquid-glass-apps (one app name per line, e.g. "AlDente") keep Liquid
 // Glass while it is disabled system-wide, so their SwiftUI glass keeps its shape and
-// DevitrifyCore turns it into frosted glass. DEVITRIFY_LIQUID_GLASS_APP tells
-// DevitrifyCore to keep the app's AppKit controls classic. This runs before AppKit and
-// SwiftUI read the feature flag.
-static void keep_liquid_glass() {
-    const char *enabled = getenv("FEATUREFLAGS_ENABLED");
-    if (!enabled || !*enabled) {
-        setenv("FEATUREFLAGS_ENABLED", "SwiftUI/Solarium", 1);
-    } else if (!strstr(enabled, "SwiftUI/Solarium")) {
-        char value[1024];
-        snprintf(value, sizeof(value), "%s:SwiftUI/Solarium", enabled);
-        setenv("FEATUREFLAGS_ENABLED", value, 1);
-    }
-    setenv("DEVITRIFY_LIQUID_GLASS_APP", "1", 1);
+// DevitrifyCore turns it into frosted glass. DevitrifyCore asks the loader whether the
+// app is one of them to keep the app's AppKit controls classic.
+// Set when the app keeps Liquid Glass. The feature flag lookup below answers "enabled" for
+// Liquid Glass in such apps; no environment variable is touched, and because dyld applies
+// the interposition when it loads the images, it holds before anything reads or caches the flag.
+static int s_keep_liquid_glass = 0;
+
+int devitrify_keeps_liquid_glass(void) {
+    return s_keep_liquid_glass;
 }
+
+extern bool _os_feature_enabled_impl(const char *domain, const char *feature);
+
+static bool devitrify_feature_enabled(const char *domain, const char *feature) {
+    if (s_keep_liquid_glass && domain && feature && !strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) return true;
+    return _os_feature_enabled_impl(domain, feature);
+}
+
+#define DYLD_INTERPOSE(replacement, replacee) \
+    __attribute__((used)) static struct { const void *replacement; const void *replacee; } _interpose_##replacee \
+    __attribute__((section("__DATA,__interpose"))) = { (const void *)(unsigned long)&replacement, (const void *)(unsigned long)&replacee }
+DYLD_INTERPOSE(devitrify_feature_enabled, _os_feature_enabled_impl);
 
 static void keep_liquid_glass_if_listed(const char *dir) {
     char executable[PATH_MAX];
@@ -49,15 +58,7 @@ static void keep_liquid_glass_if_listed(const char *dir) {
     if (home && strstr(home, "/Library/Containers/")) {
         char marker[PATH_MAX];
         snprintf(marker, sizeof(marker), "%s/Library/Application Support/devitrify-keep-liquid-glass", home);
-        if (access(marker, F_OK) != 0) return;
-
-        // The feature flag of a sandboxed process is read before this runs and then cached,
-        // unlike in other processes, so start the app again, with the environment set. The
-        // process keeps its identity.
-        const char *flags = getenv("FEATUREFLAGS_ENABLED");
-        if (flags && strstr(flags, "SwiftUI/Solarium")) return;
-        keep_liquid_glass();
-        execv(executable, *_NSGetArgv());
+        if (access(marker, F_OK) == 0) s_keep_liquid_glass = 1;
         return;
     }
 
@@ -73,7 +74,7 @@ static void keep_liquid_glass_if_listed(const char *dir) {
         char needle[PATH_MAX];
         snprintf(needle, sizeof(needle), "/%s.app/Contents/MacOS/", line);
         if (!strstr(executable, needle)) continue;
-        keep_liquid_glass();
+        s_keep_liquid_glass = 1;
         break;
     }
     fclose(file);
