@@ -1,0 +1,133 @@
+#!/bin/sh
+# Quits and reopens running apps that were started before Devitrify was loaded, so they
+# pick it up. Usage: devitrify-refresh [-n] [bundle-id ...]
+#   -n          only list the apps that would be reopened
+#   bundle-id   only consider these apps
+
+LOADER=/Users/Shared/.devitrify/libDevitrify.dylib
+FEATURE_FLAGS=/Library/Preferences/FeatureFlags/Domain/SwiftUI.plist
+
+dry_run=0
+if [ "$1" = "-n" ]; then
+    dry_run=1
+    shift
+fi
+
+if [ "$(launchctl getenv DYLD_INSERT_LIBRARIES)" != "$LOADER" ]; then
+    printf "Devitrify isn't loaded in this session. Run the devitrify script first.\n"
+    exit 1
+fi
+
+has_devitrify() {
+    ps -ww -E -o command= -p "$1" 2>/dev/null | grep -q "DYLD_INSERT_LIBRARIES=$LOADER"
+}
+
+printf "Looking for apps that were started before Devitrify was loaded...\n"
+
+# With Liquid Glass disabled, Devitrify only changes NSGlassEffectView, so apps that don't
+# use it in their executable or bundled frameworks gain nothing from being reopened.
+liquid_glass_disabled=0
+defaults read "$FEATURE_FLAGS" Solarium 2>/dev/null | grep -q "Enabled = 0" && liquid_glass_disabled=1
+
+uses_glass_view() {
+    executable=$(defaults read "$1/Contents/Info" CFBundleExecutable 2>/dev/null) || return 1
+    LC_ALL=C grep -q -a -F NSGlassEffectView "$1/Contents/MacOS/$executable" 2>/dev/null && return 0
+    [ -d "$1/Contents/Frameworks" ] || return 1
+    find "$1/Contents/Frameworks" -type f -perm +111 -exec env LC_ALL=C grep -l -a -F NSGlassEffectView {} + 2>/dev/null | grep -q .
+}
+
+# The terminal (or editor) running this script must not be quit.
+ancestors=" "
+pid=$$
+while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+    ancestors="$ancestors$pid "
+    pid=$(ps -o ppid= -p "$pid" | tr -d ' ')
+done
+
+# Running apps, menu bar apps included, as "pid<TAB>bundle id<TAB>bundle path<TAB>name".
+running_apps=$(osascript -l JavaScript -e '
+    ObjC.import("AppKit");
+    $.NSWorkspace.sharedWorkspace.runningApplications.js
+        .filter(app => app.activationPolicy !== 2 && !app.bundleURL.isNil())
+        .map(app => [app.processIdentifier, app.bundleIdentifier.isNil() ? "" : app.bundleIdentifier.js,
+                     app.bundleURL.path.js, app.localizedName.js].join("\t"))
+        .join("\n");
+')
+
+apps_to_reopen() {
+    printf '%s\n' "$running_apps" | while IFS="$(printf '\t')" read -r pid bundle_id path name; do
+        [ -n "$pid" ] || continue
+        # Only standalone apps: no helpers or extensions nested in another bundle, and no
+        # system UI under /System/Library, which launchd manages.
+        case "$path" in *.app) ;; *) continue ;; esac
+        case "${path%/*}/" in *.app/*) continue ;; esac
+        case "$path" in /System/Library/*) continue ;; esac
+        case "$ancestors" in *" $pid "*) continue ;; esac
+        if [ $# -gt 0 ]; then
+            case " $* " in *" $bundle_id "*) ;; *) continue ;; esac
+        fi
+        has_devitrify "$pid" && continue
+        [ "$liquid_glass_disabled" -eq 1 ] && ! uses_glass_view "$path" && continue
+        printf '%s\t%s\t%s\t%s\n' "$pid" "$bundle_id" "$path" "$name"
+    done
+}
+targets=$(apps_to_reopen "$@")
+
+# Control Center and Notification Center are launchd agents, relaunched by launchd itself.
+agents=""
+for label in com.apple.controlcenter com.apple.notificationcenterui.agent; do
+    pid=$(launchctl list | awk -v label="$label" '$3 == label { print $1 }')
+    if [ -n "$pid" ] && [ "$pid" != "-" ] && ! has_devitrify "$pid"; then
+        agents="$agents $label"
+    fi
+done
+[ $# -gt 0 ] && agents=""
+
+if [ -z "$targets" ] && [ -z "$agents" ]; then
+    printf "All running apps already have Devitrify loaded.\n"
+    exit 0
+fi
+
+printf "These apps were started before Devitrify was loaded:\n"
+printf '%s\n' "$targets" | while IFS="$(printf '\t')" read -r pid bundle_id path name; do
+    [ -n "$pid" ] && printf '    %s\n' "$name"
+done
+for label in $agents; do
+    case "$label" in
+        com.apple.controlcenter) printf '    Control Center\n' ;;
+        *) printf '    Notification Center\n' ;;
+    esac
+done
+[ "$dry_run" -eq 1 ] && exit 0
+
+read -r -p "Quit and reopen them now? [Y/n] " response </dev/tty || exit 0
+case "$response" in
+    [nN][oO]|[nN]) exit 0 ;;
+esac
+
+for label in $agents; do
+    launchctl kickstart -k "gui/$(id -u)/$label"
+done
+
+# Ask every app to quit the normal way, so they save their state and restore their windows.
+printf '%s\n' "$targets" | while IFS="$(printf '\t')" read -r pid bundle_id path name; do
+    [ -n "$pid" ] && osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSRunningApplication.runningApplicationWithProcessIdentifier($pid).terminate" > /dev/null
+done
+
+printf '%s\n' "$targets" | while IFS="$(printf '\t')" read -r pid bundle_id path name; do
+    [ -n "$pid" ] || continue
+    waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 20 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        printf '%s is still running, it may be asking to save changes. Quit and reopen it yourself.\n' "$name"
+        continue
+    fi
+    case "$path" in
+        */AppTranslocation/*) open -g -b "$bundle_id" ;;
+        *) open -g "$path" ;;
+    esac
+    printf 'Reopened %s.\n' "$name"
+done

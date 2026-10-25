@@ -9,7 +9,7 @@ With Liquid Glass disabled, apps that still use glass views such as `NSGlassEffe
 2. Install the Xcode Command Line Tools by running `xcode-select --install`
 3. Download [Devitrify](https://codeload.github.com/AotianNeo/Devitrify/zip/refs/heads/main) and unzip it
 4. Open Terminal and run `~/Downloads/Devitrify-main/devitrify`
-5. Quit and reopen apps that were already running, or log out and back in
+5. When the script lists apps that were already running, let it quit and reopen them so they load Devitrify
 
 This has been tested on macOS Golden Gate 27.2. The script checks that the `amfi_get_out_of_my_way=0x1` and `-arm64e_preview_abi` boot arguments are set, offers to add them if they are missing (run the script again after the reboot), builds Devitrify from source, copies it to `/Users/Shared/.devitrify` and installs a login agent that loads it into every app you open.
 
@@ -45,6 +45,15 @@ launchctl kickstart -k gui/$(id -u)/com.apple.controlcenter
 launchctl kickstart -k gui/$(id -u)/com.apple.notificationcenterui.agent
 ```
 
+## Tip: Reload apps that are already running
+Apps only load Devitrify when they launch. To quit and reopen the running apps that were started before Devitrify was loaded, for example windows restored at login, open Terminal and run the following command. It lists the apps first and asks before quitting them. With Liquid Glass disabled, it only picks apps that use `NSGlassEffectView`, because nothing changes for the others.
+
+```
+/Users/Shared/.devitrify/devitrify-refresh
+```
+
+Add `-n` to only list the apps, or bundle identifiers such as `com.apple.Music` to only consider those apps.
+
 ## How it works
 - `libDevitrify.dylib` is injected into every process through `DYLD_INSERT_LIBRARIES`. It links nothing beyond libSystem and loads `DevitrifyCore.dylib` only into processes that already have AppKit loaded, so command-line tools are unaffected.
 - With Liquid Glass disabled, every `NSGlassEffectView` in an app window gets an `NSVisualEffectView` behind its content, clipped to the glass corner radius. Regular glass uses the popover material and clear glass the HUD material. Glass that fills its window blurs the desktop; glass inside a window blurs the window's content. Glass in AppKit's own windows, such as menus, is left alone because AppKit already draws it correctly.
@@ -53,5 +62,5 @@ launchctl kickstart -k gui/$(id -u)/com.apple.notificationcenterui.agent
 ## Limitations
 - The tint color of `NSGlassEffectView` isn't reproduced.
 - SwiftUI's `.glassEffect()` and `.buttonStyle(.glass)` don't use `NSGlassEffectView`. With Liquid Glass disabled they draw only their content, for example Calculator's keys lose their round backgrounds. Devitrify doesn't change them.
-- Apps restored at login before the login agent runs start without Devitrify until you reopen them.
+- Apps restored at login before the login agent runs start without Devitrify until they are reopened, for example with `devitrify-refresh`.
 - Sandboxed app extensions, such as the panes of System Settings, don't load Devitrify. They don't need it: with Liquid Glass disabled they already draw classic controls.

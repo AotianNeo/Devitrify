@@ -15,7 +15,7 @@ fi
 
 if [ -f "$INSTALL_DIR/DevitrifyCore.dylib" ]; then
     printf "It appears that you have installed Devitrify.\n"
-    read -r -p "Do you want to uninstall it and restore system defaults? [Y/n] " response </dev/tty
+    read -r -p "Do you want to uninstall it and restore system defaults? [Y/n] " response </dev/tty || exit 1
     case "$response" in
         [nN][oO]|[nN])
             printf "Reinstalling Devitrify...\n"
@@ -25,7 +25,7 @@ if [ -f "$INSTALL_DIR/DevitrifyCore.dylib" ]; then
             if [ "$(launchctl getenv DYLD_INSERT_LIBRARIES)" = "$INSTALL_DIR/libDevitrify.dylib" ]; then
                 launchctl unsetenv DYLD_INSERT_LIBRARIES
             fi
-            rm -f "$INSTALL_DIR/DevitrifyCore.dylib" "$INSTALL_DIR/devitrify-agent"
+            rm -f "$INSTALL_DIR/DevitrifyCore.dylib" "$INSTALL_DIR/devitrify-agent" "$INSTALL_DIR/devitrify-refresh"
 
             # Processes started while Devitrify was installed still carry DYLD_INSERT_LIBRARIES,
             # and anything they launch fails without the loader. Remove it at next login instead.
@@ -82,7 +82,7 @@ else
     printf 'Devitrify loads into apps signed by Apple and other developers, which requires a\n'
     printf 'permissive AMFI. The following boot argument(s) are missing:%s\n' "$missing"
     printf '\n'
-    read -r -p "Add them to your existing boot-args? [Y/n] " response </dev/tty
+    read -r -p "Add them to your existing boot-args? [Y/n] " response </dev/tty || exit 1
     case "$response" in
         [nN][oO]|[nN])
             printf 'You can add them yourself with:\n'
@@ -95,7 +95,7 @@ else
             printf 'Setting: sudo nvram boot-args="%s"\n' "$new_boot_args"
             sudo nvram boot-args="$new_boot_args" || exit 1
             printf 'Done. This machine needs to reboot for the change to take effect.\n'
-            read -r -p "Reboot now? [Y/n] " response </dev/tty
+            read -r -p "Reboot now? [Y/n] " response </dev/tty || exit 1
             case "$response" in
                 [nN][oO]|[nN])
                     printf 'Reboot manually, then re-run this script.\n'
@@ -126,9 +126,11 @@ for file in libDevitrify.dylib DevitrifyCore.dylib; do
     cp "./build/$file" "$INSTALL_DIR/$file.new"
     mv -f "$INSTALL_DIR/$file.new" "$INSTALL_DIR/$file"
 done
-xattr -c ./assets/devitrify-agent
-cp ./assets/devitrify-agent "$INSTALL_DIR"
-chmod +x "$INSTALL_DIR/devitrify-agent"
+for script in devitrify-agent devitrify-refresh; do
+    xattr -c "./assets/$script"
+    cp "./assets/$script" "$INSTALL_DIR"
+    chmod +x "$INSTALL_DIR/$script"
+done
 
 printf 'Loading Devitrify into apps...\n'
 xattr -c ./assets/com.devitrify.agent.plist
@@ -142,4 +144,11 @@ if defaults read "$FEATURE_FLAGS" Solarium 2>/dev/null | grep -q "Enabled = 0"; 
 else
     printf 'Liquid Glass is enabled: refraction is now removed from glass. See the README to disable Liquid Glass.\n'
 fi
-printf 'Done! Quit and reopen apps that were already running to apply Devitrify to them.\n'
+printf 'Done!\n'
+
+# The agent sets DYLD_INSERT_LIBRARIES asynchronously; wait for it before looking for apps.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ "$(launchctl getenv DYLD_INSERT_LIBRARIES)" = "$INSTALL_DIR/libDevitrify.dylib" ] && break
+    sleep 0.5
+done
+"$INSTALL_DIR/devitrify-refresh"
