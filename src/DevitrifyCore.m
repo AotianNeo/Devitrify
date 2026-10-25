@@ -233,6 +233,24 @@ static void dv_installGlassFilterNeutralization(void) {
     dv_swizzle([CALayer class], @selector(setValue:forKeyPath:), (IMP)swizzled_setValueForKeyPath, &s_orig_setValueForKeyPath);
 }
 
+#pragma mark - Liquid Glass apps: classic AppKit controls
+
+// Apps listed in liquid-glass-apps run with Liquid Glass so that their SwiftUI glass keeps
+// its shape, while every other app is classic. AppKit asks _NSSwiftUICoreFeatureFlags
+// whether Liquid Glass is on; answering NO gives the app the same classic windows, menus
+// and controls as the rest of the system. SwiftUI glass, and NSGlassEffectView built on
+// it, check SwiftUI's own flag and keep working. Controls drawn by SwiftUI itself, such as
+// its buttons, still follow Liquid Glass.
+static BOOL dv_returnNo(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return NO;
+}
+
+static void dv_installClassicAppKit(void) {
+    Method m = class_getClassMethod(NSClassFromString(@"_NSSwiftUICoreFeatureFlags"), @selector(isSolariumEnabled));
+    if (m) method_setImplementation(m, (IMP)dv_returnNo);
+}
+
 #pragma mark - Master Constructor
 
 __attribute__((constructor))
@@ -240,6 +258,7 @@ static void DevitrifyInit(void) {
     @autoreleasepool {
         if (_os_feature_enabled_impl("SwiftUI", "Solarium")) {
             dv_installGlassFilterNeutralization();
+            if (getenv("DEVITRIFY_LIQUID_GLASS_APP")) dv_installClassicAppKit();
         } else {
             dv_installFrostedGlassFallback();
         }

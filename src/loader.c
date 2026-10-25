@@ -21,8 +21,9 @@ static int appkit_is_loaded(void) {
 
 // Apps named in liquid-glass-apps (one app name per line, e.g. "AlDente") keep Liquid
 // Glass while it is disabled system-wide, so their SwiftUI glass keeps its shape and
-// DevitrifyCore turns it into frosted glass. This runs before AppKit and SwiftUI read
-// the feature flag.
+// DevitrifyCore turns it into frosted glass. DEVITRIFY_LIQUID_GLASS_APP tells
+// DevitrifyCore to keep the app's AppKit controls classic. This runs before AppKit and
+// SwiftUI read the feature flag.
 static void keep_liquid_glass_if_listed(const char *dir) {
     char executable[PATH_MAX];
     uint32_t size = sizeof(executable);
@@ -49,6 +50,7 @@ static void keep_liquid_glass_if_listed(const char *dir) {
             snprintf(value, sizeof(value), "%s:SwiftUI/Solarium", enabled);
             setenv("FEATUREFLAGS_ENABLED", value, 1);
         }
+        setenv("DEVITRIFY_LIQUID_GLASS_APP", "1", 1);
         break;
     }
     fclose(file);

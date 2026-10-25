@@ -62,10 +62,11 @@ echo AlDente >> /Users/Shared/.devitrify/liquid-glass-apps
 /Users/Shared/.devitrify/devitrify-refresh com.apphousekitchen.aldente-pro
 ```
 
-The name is the app's file name without `.app`. The app's controls follow Liquid Glass too.
+The name is the app's file name without `.app`. The app's windows, menus and AppKit controls stay classic like the rest of the system; buttons and pickers that SwiftUI draws itself follow Liquid Glass.
 
 ## How it works
 - `libDevitrify.dylib` is injected into every process through `DYLD_INSERT_LIBRARIES`. It links nothing beyond libSystem and loads `DevitrifyCore.dylib` only into processes that already have AppKit loaded, so command-line tools are unaffected. For apps named in `liquid-glass-apps`, it first sets `FEATUREFLAGS_ENABLED=SwiftUI/Solarium`, before AppKit and SwiftUI read the feature flag.
+- In apps named in `liquid-glass-apps`, AppKit is told that Liquid Glass is off, so their windows, menus and controls are drawn exactly like with Liquid Glass disabled. SwiftUI glass and `NSGlassEffectView` follow SwiftUI's own flag and keep their glass.
 - With Liquid Glass disabled, every `NSGlassEffectView` in an app window gets an `NSVisualEffectView` behind its content, clipped to the glass corner radius. Regular glass uses the popover material and clear glass the HUD material. Glass that fills its window blurs the desktop; glass inside a window blurs the window's content. Glass in AppKit's own windows, such as menus, is left alone because AppKit already draws it correctly.
 - With Liquid Glass enabled, the `glassBackground` and `glassForeground` filters lose their refraction, edge bleed, chromatic aberration and shadow.
 
