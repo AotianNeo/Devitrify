@@ -1,0 +1,145 @@
+#!/bin/sh
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+INSTALL_DIR=/Users/Shared/.devitrify
+AGENT_PLIST=~/Library/LaunchAgents/com.devitrify.agent.plist
+FEATURE_FLAGS=/Library/Preferences/FeatureFlags/Domain/SwiftUI.plist
+
+macos_version=$(sw_vers -productVersion | cut -d '.' -f 1)
+if [ "$macos_version" -lt 26 ] || [ "$macos_version" -gt 27 ]; then
+    echo "This utility only supports macOS 26 and macOS 27."
+    exit 1
+fi
+
+if [ -f "$INSTALL_DIR/DevitrifyCore.dylib" ]; then
+    printf "It appears that you have installed Devitrify.\n"
+    read -r -p "Do you want to uninstall it and restore system defaults? [Y/n] " response </dev/tty
+    case "$response" in
+        [nN][oO]|[nN])
+            printf "Reinstalling Devitrify...\n"
+            ;;
+        *)
+            launchctl unload "$AGENT_PLIST" > /dev/null 2>&1
+            if [ "$(launchctl getenv DYLD_INSERT_LIBRARIES)" = "$INSTALL_DIR/libDevitrify.dylib" ]; then
+                launchctl unsetenv DYLD_INSERT_LIBRARIES
+            fi
+            rm -f "$INSTALL_DIR/DevitrifyCore.dylib" "$INSTALL_DIR/devitrify-agent"
+
+            # Processes started while Devitrify was installed still carry DYLD_INSERT_LIBRARIES,
+            # and anything they launch fails without the loader. Remove it at next login instead.
+            cat > "$AGENT_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.devitrify.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>rm -rf $INSTALL_DIR; rm -f "\$HOME/Library/LaunchAgents/com.devitrify.agent.plist"</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+EOF
+            launchctl kickstart -k "gui/$(id -u)/com.apple.controlcenter"
+            launchctl kickstart -k "gui/$(id -u)/com.apple.notificationcenterui.agent"
+            printf "Devitrify has been uninstalled. Log out and back in to finish.\n"
+            exit 0
+            ;;
+    esac
+else
+    printf "Installing Devitrify...\n"
+fi
+
+if csrutil status | grep -q "disabled"; then
+    printf "✅ System Integrity Protection (SIP) is disabled.\n"
+else
+    printf 'For this to work, you need to turn off System Integrity Protection by running `csrutil disable` in recoveryOS.\n'
+    printf 'https://developer.apple.com/documentation/security/disabling-and-enabling-system-integrity-protection\n'
+    exit 1
+fi
+
+current_boot_args=$(nvram boot-args 2>/dev/null | sed 's/^boot-args[[:space:]]*//')
+missing=""
+case " $current_boot_args " in
+    *" amfi_get_out_of_my_way=0x1 "*|*" amfi_get_out_of_my_way=1 "*) ;;
+    *) missing="$missing amfi_get_out_of_my_way=0x1" ;;
+esac
+case " $current_boot_args " in
+    *" -arm64e_preview_abi "*) ;;
+    *) missing="$missing -arm64e_preview_abi" ;;
+esac
+
+if [ -z "$missing" ]; then
+    printf "✅ AMFI is permissive (amfi_get_out_of_my_way and -arm64e_preview_abi are set).\n"
+else
+    printf 'Devitrify loads into apps signed by Apple and other developers, which requires a\n'
+    printf 'permissive AMFI. The following boot argument(s) are missing:%s\n' "$missing"
+    printf '\n'
+    read -r -p "Add them to your existing boot-args? [Y/n] " response </dev/tty
+    case "$response" in
+        [nN][oO]|[nN])
+            printf 'You can add them yourself with:\n'
+            printf '    sudo nvram boot-args="%s%s"\n' "$current_boot_args" "$missing"
+            printf 'then reboot and re-run this script.\n'
+            exit 1
+            ;;
+        *)
+            new_boot_args=$(printf '%s%s' "$current_boot_args" "$missing" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            printf 'Setting: sudo nvram boot-args="%s"\n' "$new_boot_args"
+            sudo nvram boot-args="$new_boot_args" || exit 1
+            printf 'Done. This machine needs to reboot for the change to take effect.\n'
+            read -r -p "Reboot now? [Y/n] " response </dev/tty
+            case "$response" in
+                [nN][oO]|[nN])
+                    printf 'Reboot manually, then re-run this script.\n'
+                    ;;
+                *)
+                    printf 'Rebooting now. Re-run this script after your Mac restarts.\n'
+                    sudo shutdown -r now
+                    ;;
+            esac
+            exit 1
+            ;;
+    esac
+fi
+
+if ! xcrun --find clang > /dev/null 2>&1; then
+    printf 'Devitrify is built from source, which requires the Xcode Command Line Tools.\n'
+    printf 'Install them with `xcode-select --install`, then re-run this script.\n'
+    exit 1
+fi
+
+printf 'Building Devitrify...\n'
+make clean all > /dev/null || exit 1
+
+printf 'Copying Devitrify to %s...\n' "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"
+# Running apps map the installed dylibs; replace them instead of overwriting in place.
+for file in libDevitrify.dylib DevitrifyCore.dylib; do
+    cp "./build/$file" "$INSTALL_DIR/$file.new"
+    mv -f "$INSTALL_DIR/$file.new" "$INSTALL_DIR/$file"
+done
+xattr -c ./assets/devitrify-agent
+cp ./assets/devitrify-agent "$INSTALL_DIR"
+chmod +x "$INSTALL_DIR/devitrify-agent"
+
+printf 'Loading Devitrify into apps...\n'
+xattr -c ./assets/com.devitrify.agent.plist
+mkdir -p ~/Library/LaunchAgents
+cp ./assets/com.devitrify.agent.plist ~/Library/LaunchAgents
+launchctl unload "$AGENT_PLIST" > /dev/null 2>&1
+launchctl load "$AGENT_PLIST"
+
+if defaults read "$FEATURE_FLAGS" Solarium 2>/dev/null | grep -q "Enabled = 0"; then
+    printf 'Liquid Glass is disabled: glass panels now fall back to frosted glass.\n'
+else
+    printf 'Liquid Glass is enabled: refraction is now removed from glass. See the README to disable Liquid Glass.\n'
+fi
+printf 'Done! Quit and reopen apps that were already running to apply Devitrify to them.\n'

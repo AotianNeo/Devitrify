@@ -1,0 +1,7 @@
+#!/bin/sh
+# Runs at login. Injects Devitrify into every app launched from now on, then relaunches
+# Control Center and Notification Center, which start before this agent runs.
+
+/bin/launchctl setenv DYLD_INSERT_LIBRARIES /Users/Shared/.devitrify/libDevitrify.dylib
+/bin/launchctl kickstart -k "gui/$(id -u)/com.apple.controlcenter"
+/bin/launchctl kickstart -k "gui/$(id -u)/com.apple.notificationcenterui.agent"
