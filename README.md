@@ -55,7 +55,9 @@ Apps and services only load Devitrify when they launch. To reload the ones that 
 Add `-n` to only list them. Add bundle identifiers such as `com.apple.Music` to reload only those apps, even if they already have Devitrify loaded.
 
 ## Tip: Keep Liquid Glass for specific apps
-Apps built with SwiftUI's `.glassEffect()` lose their glass shapes when Liquid Glass is disabled, for example Calculator's keys or AlDente's menu. To let such an app keep Liquid Glass, which Devitrify then turns into frosted glass, add its name to `/Users/Shared/.devitrify/liquid-glass-apps` and reload it:
+Apps built with SwiftUI's `.glassEffect()` lose their glass shapes when Liquid Glass is disabled, for example Calculator's keys or AlDente's menu. Such an app can keep Liquid Glass, which Devitrify then turns into frosted glass: choose Help > Keep Liquid Glass in the app and let it reopen.
+
+Menu bar apps such as AlDente have no visible Help menu. Add their name to `/Users/Shared/.devitrify/liquid-glass-apps` and reload them instead:
 
 ```
 echo AlDente >> /Users/Shared/.devitrify/liquid-glass-apps
@@ -73,5 +75,6 @@ The name is the app's file name without `.app`. The app's windows, menus and App
 ## Limitations
 - The tint color of `NSGlassEffectView` isn't reproduced.
 - SwiftUI's `.glassEffect()` and `.buttonStyle(.glass)` don't use `NSGlassEffectView`. With Liquid Glass disabled they draw only their content. Devitrify can't turn them into frosted glass directly; keep Liquid Glass for those apps instead.
+- Some apps crash at launch with Liquid Glass disabled, for example FindMy. Keeping Liquid Glass for them through `liquid-glass-apps` doesn't prevent the crash; opening them with `open -a FindMy --env FEATUREFLAGS_ENABLED=SwiftUI/Solarium` does.
 - Apps restored at login before the login agent runs start without Devitrify until they are reopened, for example with `devitrify-refresh`.
 - Sandboxed app extensions, such as the panes of System Settings, don't load Devitrify. They don't need it: with Liquid Glass disabled they already draw classic controls.

@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
 
 @interface CAFilter : NSObject
 + (instancetype)filterWithType:(NSString *)type;
@@ -251,6 +252,100 @@ static void dv_installClassicAppKit(void) {
     if (m) method_setImplementation(m, (IMP)dv_returnNo);
 }
 
+#pragma mark - Help menu: Keep Liquid Glass
+
+// With Liquid Glass disabled system-wide, the Help menu of every app gets a "Keep Liquid
+// Glass" item that adds the app to liquid-glass-apps (or removes it) and offers to reopen
+// the app so the change takes effect.
+
+static NSString *dv_liquidGlassAppsPath(void) {
+    Dl_info info;
+    if (!dladdr((const void *)dv_liquidGlassAppsPath, &info) || !info.dli_fname) return nil;
+    return [[@(info.dli_fname) stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"liquid-glass-apps"];
+}
+
+// The name liquid-glass-apps matches against: the app's file name without ".app".
+static NSString *dv_appName(void) {
+    return NSBundle.mainBundle.bundleURL.lastPathComponent.stringByDeletingPathExtension;
+}
+
+static NSMutableArray<NSString *> *dv_liquidGlassAppsLines(void) {
+    NSString *text = [NSString stringWithContentsOfFile:dv_liquidGlassAppsPath() encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    NSMutableArray<NSString *> *lines = [[text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] mutableCopy];
+    while (lines.count && lines.lastObject.length == 0) [lines removeLastObject];
+    return lines;
+}
+
+static BOOL dv_liquidGlassDisabledSystemWide(void) {
+    NSDictionary *flags = [NSDictionary dictionaryWithContentsOfFile:@"/Library/Preferences/FeatureFlags/Domain/SwiftUI.plist"];
+    id enabled = flags[@"Solarium"][@"Enabled"];
+    return enabled && ![enabled boolValue];
+}
+
+// Reopens the app once it has quit. If quitting is cancelled, for example to keep unsaved
+// changes, it gives up after a minute instead of reopening the app later by surprise.
+static void dv_reopenApp(void) {
+    NSString *script = [NSString stringWithFormat:
+        @"i=0; while kill -0 %d 2>/dev/null && [ $i -lt 300 ]; do sleep 0.2; i=$((i+1)); done; "
+        @"kill -0 %d 2>/dev/null || /usr/bin/open \"$0\"", getpid(), getpid()];
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
+    task.arguments = @[@"-c", script, NSBundle.mainBundle.bundlePath];
+    if ([task launchAndReturnError:nil]) [NSApp terminate:nil];
+}
+
+@interface DVKeepLiquidGlassItemTarget : NSObject
+@end
+
+@implementation DVKeepLiquidGlassItemTarget
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    item.state = [dv_liquidGlassAppsLines() containsObject:dv_appName()] ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
+}
+
+- (void)toggleKeepLiquidGlass:(NSMenuItem *)item {
+    (void)item;
+    NSString *name = dv_appName();
+    NSMutableArray<NSString *> *lines = dv_liquidGlassAppsLines();
+    BOOL keep = ![lines containsObject:name];
+    if (keep) [lines addObject:name]; else [lines removeObject:name];
+    NSString *text = [[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+    if (![text writeToFile:dv_liquidGlassAppsPath() atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = [NSString stringWithFormat:keep ? @"%@ will keep Liquid Glass." : @"%@ will no longer keep Liquid Glass.", name];
+    alert.informativeText = [NSString stringWithFormat:@"Reopen %@ to apply the change.", name];
+    [alert addButtonWithTitle:@"Reopen Now"];
+    [alert addButtonWithTitle:@"Later"];
+    if ([alert runModal] == NSAlertFirstButtonReturn) dv_reopenApp();
+}
+
+@end
+
+static void dv_installKeepLiquidGlassItem(void) {
+    if (!dv_liquidGlassDisabledSystemWide()) return;
+    NSString *path = dv_liquidGlassAppsPath();
+    if (!path || ![NSFileManager.defaultManager isWritableFileAtPath:path.stringByDeletingLastPathComponent]) return;
+    if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) return;
+
+    static DVKeepLiquidGlassItemTarget *target;
+    target = [[DVKeepLiquidGlassItemTarget alloc] init];
+    // Apps can rebuild their menus, so the item is (re)added whenever the app activates.
+    void (^addItem)(NSNotification *) = ^(NSNotification *note) {
+        (void)note;
+        NSMenu *help = NSApp.helpMenu;
+        if (!help || [help indexOfItemWithTarget:target andAction:@selector(toggleKeepLiquidGlass:)] >= 0) return;
+        [help addItem:NSMenuItem.separatorItem];
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"Keep Liquid Glass" action:@selector(toggleKeepLiquidGlass:) keyEquivalent:@""];
+        item.target = target;
+        [help addItem:item];
+    };
+    for (NSNotificationName name in @[NSApplicationDidFinishLaunchingNotification, NSApplicationDidBecomeActiveNotification]) {
+        [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue usingBlock:addItem];
+    }
+}
+
 #pragma mark - Master Constructor
 
 __attribute__((constructor))
@@ -262,5 +357,6 @@ static void DevitrifyInit(void) {
         } else {
             dv_installFrostedGlassFallback();
         }
+        dv_installKeepLiquidGlassItem();
     }
 }
