@@ -299,9 +299,12 @@ static NSString *dv_keepMarkerPath(void) {
 }
 
 // Whether this app runs with Liquid Glass kept, as the loader decided, whether by the
-// list, the marker or because the app uses SwiftUI's glass effect.
+// list, the marker or because the app uses SwiftUI's glass effect. Updated in-process if
+// the user toggles the menu item and chooses "Later".
+static BOOL s_keepsLiquidGlass = NO;
+
 static BOOL dv_keepsLiquidGlass(void) {
-    return dv_keepsLiquidGlassViaLoader();
+    return s_keepsLiquidGlass;
 }
 
 // Whether Liquid Glass is turned off for this app because it is disabled system-wide.
@@ -347,6 +350,7 @@ static void dv_reopenApp(void) {
         NSString *text = [[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
         if (![text writeToFile:dv_liquidGlassAppsPath() atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
     }
+    s_keepsLiquidGlass = keep;
 
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = [NSString stringWithFormat:keep ? @"%@ will keep Liquid Glass." : @"%@ will no longer keep Liquid Glass.", name];
@@ -474,7 +478,8 @@ static void dv_installCompatibilityAccessibilityFix(void) {
 __attribute__((constructor))
 static void DevitrifyInit(void) {
     @autoreleasepool {
-        s_liquidGlassOffSystemWide = dv_keepsLiquidGlassViaLoader() || !_os_feature_enabled_impl("SwiftUI", "Solarium");
+        s_keepsLiquidGlass = dv_keepsLiquidGlassViaLoader();
+        s_liquidGlassOffSystemWide = s_keepsLiquidGlass || !_os_feature_enabled_impl("SwiftUI", "Solarium");
         if (_os_feature_enabled_impl("SwiftUI", "Solarium")) {
             dv_installGlassFilterNeutralization();
             if (dv_keepsLiquidGlassViaLoader() && !dv_compatibilityModeViaLoader()) dv_installClassicAppKit();

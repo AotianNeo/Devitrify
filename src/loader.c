@@ -178,9 +178,9 @@ static void keep_liquid_glass_if_listed(const char *dir) {
         while (file && fgets(line, sizeof(line), file)) {
             line[strcspn(line, "\r\n")] = '\0';
             if (line[0] == '\0' || line[0] == '#') continue;
-            char *space = strchr(line, ' ');
+            char *space = strrchr(line, ' ');
             const char *option = "";
-            if (space) {
+            if (space && (!strcmp(space + 1, "off") || !strcmp(space + 1, "stable") || !strcmp(space + 1, "compat"))) {
                 *space = '\0';
                 option = space + 1;
             }
