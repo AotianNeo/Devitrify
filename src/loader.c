@@ -216,6 +216,24 @@ static void devitrify_load_core(void) {
     keep_liquid_glass_if_listed(path);
 
     if (!appkit_is_loaded()) return;
+
+    // Check if a hot-reloaded core generation is active
+    char reload_path[PATH_MAX];
+    snprintf(reload_path, sizeof(reload_path), "%s/reload/current", path);
+    FILE *f = fopen(reload_path, "r");
+    if (f) {
+        char line[PATH_MAX] = "";
+        if (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (line[0] && access(line, R_OK) == 0) {
+                fclose(f);
+                dlopen(line, RTLD_NOW | RTLD_LOCAL);
+                return;
+            }
+        }
+        fclose(f);
+    }
+
     strlcat(path, "/DevitrifyCore.dylib", sizeof(path));
     dlopen(path, RTLD_NOW | RTLD_LOCAL);
 }

@@ -5,8 +5,9 @@ INSTALL_DIR = /Users/Shared/.devitrify
 
 # codesign must not run with a previous Devitrify build injected into it.
 SIGN = env -u DYLD_INSERT_LIBRARIES codesign -s - -f
+SIGN_DEBUG = env -u DYLD_INSERT_LIBRARIES codesign -s - -f --entitlements assets/debugger.entitlements
 
-all: build/libDevitrify.dylib build/DevitrifyCore.dylib build/devitrify-menubar
+all: build/libDevitrify.dylib build/DevitrifyCore.dylib build/devitrify-menubar build/devitrify-reload
 
 build/libDevitrify.dylib: src/loader.c
 	mkdir -p build
@@ -25,7 +26,23 @@ build/devitrify-menubar: src/menubar.c
 		-framework SkyLight -framework CoreGraphics $< -o $@
 	$(SIGN) $@
 
+build/devitrify-reload: src/reload.c assets/debugger.entitlements
+	mkdir -p build
+	$(CC) $(CFLAGS) $< -o $@
+	$(SIGN_DEBUG) $@
+
+install: all
+	mkdir -p $(INSTALL_DIR)
+	mkdir -p $(INSTALL_DIR)/reload
+	cp build/libDevitrify.dylib $(INSTALL_DIR)/libDevitrify.dylib.new && mv -f $(INSTALL_DIR)/libDevitrify.dylib.new $(INSTALL_DIR)/libDevitrify.dylib
+	cp build/DevitrifyCore.dylib $(INSTALL_DIR)/DevitrifyCore.dylib.new && mv -f $(INSTALL_DIR)/DevitrifyCore.dylib.new $(INSTALL_DIR)/DevitrifyCore.dylib
+	cp build/devitrify-reload $(INSTALL_DIR)/devitrify-reload
+	chmod +x $(INSTALL_DIR)/devitrify-reload
+
+reload: install
+	$(INSTALL_DIR)/devitrify-reload
+
 clean:
 	rm -rf build
 
-.PHONY: all clean
+.PHONY: all install reload clean

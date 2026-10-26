@@ -2,6 +2,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <notify.h>
 
 @interface CAFilter : NSObject
 + (instancetype)filterWithType:(NSString *)type;
@@ -17,38 +18,65 @@ static BOOL dv_compatibilityModeViaLoader(void) {
     return compat && compat();
 }
 
-static BOOL dv_compatibilityModeViaLoader(void);
 static BOOL dv_keepsLiquidGlassViaLoader(void) {
     int (*keeps)(void) = dlsym(RTLD_DEFAULT, "devitrify_keeps_liquid_glass");
     return keeps && keeps();
 }
 
-// ============================================================================
-//  Devitrify
-//
-//  Turns Liquid Glass back into frosted glass. Loaded into apps by libDevitrify.dylib.
-//  The branch is chosen by the process's own Solarium (Liquid Glass) state; no
-//  process names are hardcoded.
-//
-//  1. Liquid Glass OFF (disabled through the SwiftUI/Solarium feature flag):
-//     AppKit and SwiftUI draw classic controls, but NSGlassEffectView and
-//     NSGlassEffectContainerView render no backdrop at all, so glass windows and
-//     panels come out fully transparent. Every NSGlassEffectView in an app window
-//     gets an NSVisualEffectView behind its content, clipped to the glass corner
-//     radius. The class itself is left alone: AppKit's own menus use it internally
-//     and rely on its real implementation.
-//
-//  2. Liquid Glass ON (system-wide, or per process through
-//     FEATUREFLAGS_ENABLED=SwiftUI/Solarium: Control Center and Notification Center
-//     under launchbad-revived, and apps named in liquid-glass-apps, see loader.c):
-//     refraction, bleed, aberration and shadow are
-//     stripped from the glassBackground and glassForeground filters, leaving a plain
-//     Gaussian blur.
-// ============================================================================
+#pragma mark - Idempotent Swizzle Registry
+
+// Process-wide map of original IMPs stored on [NSApplication class] so hot-reloads
+// never chain swizzles or lose the original implementation.
+static NSMutableDictionary<NSString *, NSValue *> *dv_originalIMPMap(void) {
+    Class host = [NSApplication class];
+    NSMutableDictionary *map = objc_getAssociatedObject(host, @selector(dv_originalIMPMap));
+    if (!map) {
+        map = [NSMutableDictionary dictionary];
+        objc_setAssociatedObject(host, @selector(dv_originalIMPMap), map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return map;
+}
+
+static void dv_swizzle(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
+    if (!cls || !sel || !newImp) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    NSString *key = [NSString stringWithFormat:@"-[%s %s]", class_getName(cls), sel_getName(sel)];
+    NSMutableDictionary *map = dv_originalIMPMap();
+    NSValue *val = map[key];
+    if (val) {
+        if (outOrig) *outOrig = (IMP)val.pointerValue;
+        method_setImplementation(m, newImp);
+    } else {
+        IMP orig = method_setImplementation(m, newImp);
+        if (orig) {
+            map[key] = [NSValue valueWithPointer:(const void *)orig];
+            if (outOrig) *outOrig = orig;
+        }
+    }
+}
+
+static void dv_swizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
+    if (!cls || !sel || !newImp) return;
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) return;
+    NSString *key = [NSString stringWithFormat:@"+[%s %s]", class_getName(cls), sel_getName(sel)];
+    NSMutableDictionary *map = dv_originalIMPMap();
+    NSValue *val = map[key];
+    if (val) {
+        if (outOrig) *outOrig = (IMP)val.pointerValue;
+        method_setImplementation(m, newImp);
+    } else {
+        IMP orig = method_setImplementation(m, newImp);
+        if (orig) {
+            map[key] = [NSValue valueWithPointer:(const void *)orig];
+            if (outOrig) *outOrig = orig;
+        }
+    }
+}
 
 #pragma mark - Solarium OFF: NSGlassEffectView -> NSVisualEffectView
 
-// NSGlassEffectView.Style
 enum { DVGlassStyleRegular = 0, DVGlassStyleClear = 1 };
 
 @interface NSVisualEffectView (DVPrivate)
@@ -59,8 +87,6 @@ static NSVisualEffectMaterial dv_materialForGlassStyle(NSInteger style) {
     return style == DVGlassStyleClear ? NSVisualEffectMaterialHUDWindow : NSVisualEffectMaterialPopover;
 }
 
-// Glass that forms the whole window background blurs the desktop behind the
-// window; glass placed over window content blurs that content instead.
 static NSVisualEffectBlendingMode dv_blendingModeForGlass(NSView *glass) {
     NSView *root = glass.window.contentView;
     BOOL isWindowBackground = root && (glass == root ||
@@ -72,15 +98,13 @@ static CGFloat dv_clampedCornerRadius(CGFloat radius, NSRect bounds) {
     return MAX(0.0, MIN(radius, MIN(NSWidth(bounds), NSHeight(bounds)) / 2.0));
 }
 
-static const void *kDVBackdropKey = &kDVBackdropKey;
+static NSView *dv_frostedBackdropForGlass(NSView *glass) {
+    return objc_getAssociatedObject(glass, @selector(dv_frostedBackdropForGlass:));
+}
 
-@interface DVFrostedBackdropView : NSVisualEffectView
-@end
-
-@implementation DVFrostedBackdropView
-- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
-- (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return NO; }
-@end
+static void dv_setFrostedBackdropForGlass(NSView *glass, NSView *fx) {
+    objc_setAssociatedObject(glass, @selector(dv_frostedBackdropForGlass:), fx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
 
 // AppKit and other system frameworks build menus and similar chrome out of
 // NSGlassEffectView too and draw them correctly by themselves. Only glass in windows
@@ -95,16 +119,53 @@ static BOOL dv_isAppWindow(NSWindow *window) {
     return YES;
 }
 
+static NSView *dv_hitTestPassThrough(id self, SEL _cmd, NSPoint pt) {
+    (void)self; (void)_cmd; (void)pt;
+    return nil;
+}
+
+static BOOL dv_acceptsFirstMouseNo(id self, SEL _cmd, NSEvent *event) {
+    (void)self; (void)_cmd; (void)event;
+    return NO;
+}
+
+static Class dv_ensureFrostedBackdropViewClass(void) {
+    Class cls = objc_getClass("DVFrostedBackdropView");
+    if (!cls) {
+        cls = objc_allocateClassPair([NSVisualEffectView class], "DVFrostedBackdropView", 0);
+        if (cls) {
+            class_addMethod(cls, @selector(hitTest:), (IMP)dv_hitTestPassThrough, "@@:{CGPoint=dd}");
+            class_addMethod(cls, @selector(acceptsFirstMouse:), (IMP)dv_acceptsFirstMouseNo, "c@:@");
+            objc_registerClassPair(cls);
+        } else {
+            cls = [NSVisualEffectView class];
+        }
+    } else {
+        class_replaceMethod(cls, @selector(hitTest:), (IMP)dv_hitTestPassThrough, "@@:{CGPoint=dd}");
+        class_replaceMethod(cls, @selector(acceptsFirstMouse:), (IMP)dv_acceptsFirstMouseNo, "c@:@");
+    }
+    return cls;
+}
+
 static void dv_updateFrostedBackdrop(NSView *glass) {
     if (!dv_isAppWindow(glass.window)) return;
-    DVFrostedBackdropView *fx = objc_getAssociatedObject(glass, kDVBackdropKey);
+    NSVisualEffectView *fx = (NSVisualEffectView *)dv_frostedBackdropForGlass(glass);
     if (!fx) {
-        fx = [[DVFrostedBackdropView alloc] initWithFrame:glass.bounds];
-        fx.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-        fx.state = NSVisualEffectStateActive;
-        objc_setAssociatedObject(glass, kDVBackdropKey, fx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // Look for existing backdrop subview if reloaded from an earlier version
+        for (NSView *sub in glass.subviews) {
+            if ([NSStringFromClass([sub class]) isEqualToString:@"DVFrostedBackdropView"]) {
+                fx = (NSVisualEffectView *)sub;
+                break;
+            }
+        }
+        if (!fx) {
+            Class cls = dv_ensureFrostedBackdropViewClass();
+            fx = [[cls alloc] initWithFrame:glass.bounds];
+            fx.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+            fx.state = NSVisualEffectStateActive;
+        }
+        dv_setFrostedBackdropForGlass(glass, fx);
     }
-    // Keep the backdrop as the bottom-most subview, below the glass content.
     if (fx.superview != glass || glass.subviews.firstObject != fx) {
         [glass addSubview:fx positioned:NSWindowBelow relativeTo:nil];
     }
@@ -116,31 +177,26 @@ static void dv_updateFrostedBackdrop(NSView *glass) {
 
 static IMP s_orig_glass_layout = NULL;
 static void swizzled_glass_layout(NSView *self, SEL _cmd) {
-    ((void (*)(id, SEL))s_orig_glass_layout)(self, _cmd);
+    if (s_orig_glass_layout) ((void (*)(id, SEL))s_orig_glass_layout)(self, _cmd);
     dv_updateFrostedBackdrop(self);
 }
 
 static IMP s_orig_glass_viewDidMoveToWindow = NULL;
 static void swizzled_glass_viewDidMoveToWindow(NSView *self, SEL _cmd) {
-    ((void (*)(id, SEL))s_orig_glass_viewDidMoveToWindow)(self, _cmd);
+    if (s_orig_glass_viewDidMoveToWindow) ((void (*)(id, SEL))s_orig_glass_viewDidMoveToWindow)(self, _cmd);
     self.needsLayout = YES;
 }
 
 static IMP s_orig_glass_setCornerRadius = NULL;
 static void swizzled_glass_setCornerRadius(NSView *self, SEL _cmd, CGFloat radius) {
-    ((void (*)(id, SEL, CGFloat))s_orig_glass_setCornerRadius)(self, _cmd, radius);
+    if (s_orig_glass_setCornerRadius) ((void (*)(id, SEL, CGFloat))s_orig_glass_setCornerRadius)(self, _cmd, radius);
     self.needsLayout = YES;
 }
 
 static IMP s_orig_glass_setStyle = NULL;
 static void swizzled_glass_setStyle(NSView *self, SEL _cmd, NSInteger style) {
-    ((void (*)(id, SEL, NSInteger))s_orig_glass_setStyle)(self, _cmd, style);
+    if (s_orig_glass_setStyle) ((void (*)(id, SEL, NSInteger))s_orig_glass_setStyle)(self, _cmd, style);
     self.needsLayout = YES;
-}
-
-static void dv_swizzle(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
-    Method m = class_getInstanceMethod(cls, sel);
-    if (m) *outOrig = method_setImplementation(m, newImp);
 }
 
 static void dv_installFrostedGlassFallback(void) {
@@ -152,17 +208,35 @@ static void dv_installFrostedGlassFallback(void) {
     dv_swizzle(glassCls, @selector(setStyle:), (IMP)swizzled_glass_setStyle, &s_orig_glass_setStyle);
 }
 
-#pragma mark - Classic menu shadow fix
+#pragma mark - Classic menu enforcement
 
-// When SwiftUI/Solarium is disabled, NSMenuUseGlassWindowStyle still defaults to YES
-// (via _NSEnableFlexiglass), which makes -[NSPopupMenuWindow shadowOptions] return 0
-// instead of 2 and strips the menu window's drop shadow and rim. Disabling
-// NSMenuUseGlassWindowStyle restores shadowOptions = 2 on classic menus.
-static void dv_installClassicMenuShadowFix(void) {
+static IMP s_orig_boolForKey = NULL;
+static BOOL swizzled_boolForKey(NSUserDefaults *self, SEL _cmd, NSString *key) {
+    if ([key hasPrefix:@"NSGlassMenu"] || [key isEqualToString:@"NSMenuUseGlassWindowStyle"]) {
+        return NO;
+    }
+    return s_orig_boolForKey ? ((BOOL (*)(id, SEL, NSString *))s_orig_boolForKey)(self, _cmd, key) : NO;
+}
+
+static NSInteger swizzled_shadowOptions(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return 2;
+}
+
+static void dv_installClassicMenuEnforcement(void) {
+    dv_swizzle([NSUserDefaults class], @selector(boolForKey:), (IMP)swizzled_boolForKey, &s_orig_boolForKey);
+
+    Class popupCls = NSClassFromString(@"NSPopupMenuWindow");
+    if (popupCls) {
+        dv_swizzle(popupCls, @selector(shadowOptions), (IMP)swizzled_shadowOptions, NULL);
+    }
+
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         @"NSGlassMenusEnabled": @NO,
         @"NSGlassMenuLayoutEnabled": @NO,
         @"NSMenuUseGlassWindowStyle": @NO,
+        @"NSGlassMenusUsePlainBorderView": @NO,
+        @"NSGlassMenuContentAboveGlass": @NO,
     }];
 }
 
@@ -170,14 +244,19 @@ static void dv_installClassicMenuShadowFix(void) {
 
 static double dv_getGlassBlurRadius(void) {
     static double s_radius = 25.0;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        const char *env = getenv("DEVITRIFY_BLUR_RADIUS");
-        if (env) {
-            double v = atof(env);
-            if (v >= 0.0) s_radius = v;
-        }
-    });
+    // Check dynamic override file or environment on hot-reload
+    NSString *conf = [NSString stringWithContentsOfFile:@"/Users/Shared/.devitrify/blur-radius"
+                                               encoding:NSUTF8StringEncoding
+                                                  error:nil];
+    if (conf && conf.length > 0) {
+        double v = [conf doubleValue];
+        if (v >= 0.0) return v;
+    }
+    const char *env = getenv("DEVITRIFY_BLUR_RADIUS");
+    if (env) {
+        double v = atof(env);
+        if (v >= 0.0) return v;
+    }
     return s_radius;
 }
 
@@ -210,7 +289,7 @@ static void dv_neutralizeGlassFilter(id filter) {
 
 static IMP s_orig_filterWithType = NULL;
 static id swizzled_filterWithType(id self, SEL _cmd, NSString *type) {
-    id f = ((id (*)(id, SEL, NSString *))s_orig_filterWithType)(self, _cmd, type);
+    id f = s_orig_filterWithType ? ((id (*)(id, SEL, NSString *))s_orig_filterWithType)(self, _cmd, type) : nil;
     if (f && dv_isGlassFilterType(type)) dv_neutralizeGlassFilter(f);
     return f;
 }
@@ -226,17 +305,17 @@ static void swizzled_cafilter_setValueForKey(id self, SEL _cmd, id value, NSStri
             value = @(dv_getGlassBlurRadius());
         }
     }
-    ((void (*)(id, SEL, id, NSString *))s_orig_cafilter_setValueForKey)(self, _cmd, value, key);
+    if (s_orig_cafilter_setValueForKey) {
+        ((void (*)(id, SEL, id, NSString *))s_orig_cafilter_setValueForKey)(self, _cmd, value, key);
+    }
 }
 
 static IMP s_orig_setFilters = NULL;
 static void swizzled_setFilters(id self, SEL _cmd, NSArray *filters) {
     for (id f in filters) dv_neutralizeGlassFilter(f);
-    ((void (*)(id, SEL, NSArray *))s_orig_setFilters)(self, _cmd, filters);
+    if (s_orig_setFilters) ((void (*)(id, SEL, NSArray *))s_orig_setFilters)(self, _cmd, filters);
 }
 
-// Animations address filter inputs through key paths such as
-// "filters.glassBackground.inputRefractionAmount".
 static IMP s_orig_setValueForKeyPath = NULL;
 static void swizzled_setValueForKeyPath(id self, SEL _cmd, id value, NSString *keyPath) {
     if ([keyPath hasPrefix:@"filters.glass"]) {
@@ -246,14 +325,15 @@ static void swizzled_setValueForKeyPath(id self, SEL _cmd, id value, NSString *k
             value = @(dv_getGlassBlurRadius());
         }
     }
-    ((void (*)(id, SEL, id, NSString *))s_orig_setValueForKeyPath)(self, _cmd, value, keyPath);
+    if (s_orig_setValueForKeyPath) {
+        ((void (*)(id, SEL, id, NSString *))s_orig_setValueForKeyPath)(self, _cmd, value, keyPath);
+    }
 }
 
 static void dv_installGlassFilterNeutralization(void) {
     Class filterCls = NSClassFromString(@"CAFilter");
     if (filterCls) {
-        Method m = class_getClassMethod(filterCls, @selector(filterWithType:));
-        if (m) s_orig_filterWithType = method_setImplementation(m, (IMP)swizzled_filterWithType);
+        dv_swizzleClassMethod(filterCls, @selector(filterWithType:), (IMP)swizzled_filterWithType, &s_orig_filterWithType);
         dv_swizzle(filterCls, @selector(setValue:forKey:), (IMP)swizzled_cafilter_setValueForKey, &s_orig_cafilter_setValueForKey);
     }
     dv_swizzle([CALayer class], @selector(setFilters:), (IMP)swizzled_setFilters, &s_orig_setFilters);
@@ -262,35 +342,22 @@ static void dv_installGlassFilterNeutralization(void) {
 
 #pragma mark - Liquid Glass apps: classic AppKit controls
 
-// Apps listed in liquid-glass-apps run with Liquid Glass so that their SwiftUI glass keeps
-// its shape, while every other app is classic. AppKit asks _NSSwiftUICoreFeatureFlags
-// whether Liquid Glass is on; answering NO gives the app the same classic windows, menus
-// and controls as the rest of the system. SwiftUI glass, and NSGlassEffectView built on
-// it, check SwiftUI's own flag and keep working. Controls drawn by SwiftUI itself, such as
-// its buttons, still follow Liquid Glass.
 static BOOL dv_returnNo(id self, SEL _cmd) {
     (void)self; (void)_cmd;
     return NO;
 }
 
 static void dv_installClassicAppKit(void) {
-    Method m = class_getClassMethod(NSClassFromString(@"_NSSwiftUICoreFeatureFlags"), @selector(isSolariumEnabled));
-    if (m) method_setImplementation(m, (IMP)dv_returnNo);
+    Class cls = NSClassFromString(@"_NSSwiftUICoreFeatureFlags");
+    if (cls) dv_swizzleClassMethod(cls, @selector(isSolariumEnabled), (IMP)dv_returnNo, NULL);
 }
 
 #pragma mark - Help menu: Keep Liquid Glass
 
-// With Liquid Glass disabled system-wide, the Help menu of every app gets a "Keep Liquid
-// Glass" item that adds the app to liquid-glass-apps (or removes it) and offers to reopen
-// the app so the change takes effect.
-
 static NSString *dv_liquidGlassAppsPath(void) {
-    Dl_info info;
-    if (!dladdr((const void *)dv_liquidGlassAppsPath, &info) || !info.dli_fname) return nil;
-    return [[@(info.dli_fname) stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"liquid-glass-apps"];
+    return @"/Users/Shared/.devitrify/liquid-glass-apps";
 }
 
-// The name liquid-glass-apps matches against: the app's file name without ".app".
 static NSString *dv_appName(void) {
     return NSBundle.mainBundle.bundleURL.lastPathComponent.stringByDeletingPathExtension;
 }
@@ -302,8 +369,6 @@ static NSMutableArray<NSString *> *dv_liquidGlassAppsLines(void) {
     return lines;
 }
 
-// Sandboxed apps can't read liquid-glass-apps. They keep a marker file in their own
-// container instead, which the app can read and write itself.
 static BOOL dv_isSandboxed(void) {
     return [NSHomeDirectory() containsString:@"/Library/Containers/"];
 }
@@ -312,21 +377,11 @@ static NSString *dv_keepMarkerPath(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/devitrify-keep-liquid-glass"];
 }
 
-// Whether this app runs with Liquid Glass kept, as the loader decided, whether by the
-// list, the marker or because the app uses SwiftUI's glass effect. Updated in-process if
-// the user toggles the menu item and chooses "Later".
 static BOOL s_keepsLiquidGlass = NO;
+static BOOL dv_keepsLiquidGlass(void) { return s_keepsLiquidGlass; }
 
-static BOOL dv_keepsLiquidGlass(void) {
-    return s_keepsLiquidGlass;
-}
-
-// Whether Liquid Glass is turned off for this app because it is disabled system-wide.
-// Evaluated before Devitrify enables it for apps that keep it.
 static BOOL s_liquidGlassOffSystemWide = NO;
 
-// Reopens the app once it has quit. If quitting is cancelled, for example to keep unsaved
-// changes, it gives up after a minute instead of reopening the app later by surprise.
 static void dv_reopenApp(void) {
     NSString *script = [NSString stringWithFormat:
         @"i=0; while kill -0 %d 2>/dev/null && [ $i -lt 300 ]; do sleep 0.2; i=$((i+1)); done; "
@@ -337,18 +392,14 @@ static void dv_reopenApp(void) {
     if ([task launchAndReturnError:nil]) [NSApp terminate:nil];
 }
 
-@interface DVKeepLiquidGlassItemTarget : NSObject
-@end
-
-@implementation DVKeepLiquidGlassItemTarget
-
-- (BOOL)validateMenuItem:(NSMenuItem *)item {
+static BOOL dv_validateMenuItemTarget(id self, SEL _cmd, NSMenuItem *item) {
+    (void)self; (void)_cmd;
     item.state = dv_keepsLiquidGlass() ? NSControlStateValueOn : NSControlStateValueOff;
     return YES;
 }
 
-- (void)toggleKeepLiquidGlass:(NSMenuItem *)item {
-    (void)item;
+static void dv_toggleKeepLiquidGlassAction(id self, SEL _cmd, NSMenuItem *item) {
+    (void)self; (void)_cmd; (void)item;
     NSString *name = dv_appName();
     BOOL keep = !dv_keepsLiquidGlass();
     if (dv_isSandboxed()) {
@@ -374,7 +425,23 @@ static void dv_reopenApp(void) {
     if ([alert runModal] == NSAlertFirstButtonReturn) dv_reopenApp();
 }
 
-@end
+static id dv_ensureKeepLiquidGlassItemTarget(void) {
+    Class cls = objc_getClass("DVKeepLiquidGlassItemTarget");
+    if (!cls) {
+        cls = objc_allocateClassPair([NSObject class], "DVKeepLiquidGlassItemTarget", 0);
+        if (cls) {
+            class_addMethod(cls, @selector(validateMenuItem:), (IMP)dv_validateMenuItemTarget, "c@:@");
+            class_addMethod(cls, @selector(toggleKeepLiquidGlass:), (IMP)dv_toggleKeepLiquidGlassAction, "v@:@");
+            objc_registerClassPair(cls);
+        } else {
+            cls = [NSObject class];
+        }
+    } else {
+        class_replaceMethod(cls, @selector(validateMenuItem:), (IMP)dv_validateMenuItemTarget, "c@:@");
+        class_replaceMethod(cls, @selector(toggleKeepLiquidGlass:), (IMP)dv_toggleKeepLiquidGlassAction, "v@:@");
+    }
+    return [[cls alloc] init];
+}
 
 static void dv_installKeepLiquidGlassItem(void) {
     if (!s_liquidGlassOffSystemWide) return;
@@ -384,14 +451,10 @@ static void dv_installKeepLiquidGlassItem(void) {
     }
     if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) return;
 
-    static DVKeepLiquidGlassItemTarget *target;
-    target = [[DVKeepLiquidGlassItemTarget alloc] init];
+    id target = dv_ensureKeepLiquidGlassItemTarget();
 
-    // SwiftUI apps rebuild their menus whenever their state changes, which removes the item,
-    // so it is added again after every change to the Help menu.
     static __weak NSMenu *observedMenu;
-    static void (^addItem)(void);
-    addItem = ^{
+    void (^addItem)(void) = ^{
         NSMenu *help = NSApp.helpMenu;
         if (!help) return;
         if ([help indexOfItemWithTarget:target andAction:@selector(toggleKeepLiquidGlass:)] < 0) {
@@ -404,7 +467,15 @@ static void dv_installKeepLiquidGlassItem(void) {
             observedMenu = help;
             [NSNotificationCenter.defaultCenter addObserverForName:NSMenuDidChangeItemNotification object:help queue:nil usingBlock:^(NSNotification *note) {
                 (void)note;
-                dispatch_async(dispatch_get_main_queue(), addItem);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSMenu *h = NSApp.helpMenu;
+                    if (h && [h indexOfItemWithTarget:target andAction:@selector(toggleKeepLiquidGlass:)] < 0) {
+                        if (h.numberOfItems > 0) [h addItem:NSMenuItem.separatorItem];
+                        NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:@"Keep Liquid Glass" action:@selector(toggleKeepLiquidGlass:) keyEquivalent:@""];
+                        it.target = target;
+                        [h addItem:it];
+                    }
+                });
             }];
         }
     };
@@ -418,36 +489,10 @@ static void dv_installKeepLiquidGlassItem(void) {
 
 #pragma mark - Compatibility mode: accessibility protection
 
-// In compatibility mode (and older SDK emulation), SwiftUI asks legacy AppKit controls
-// for attributes like AXSubrole, AXIsElement, etc. that older AppKit implementations
-// don't declare. AppKit throws NSAccessibilityException for undeclared attributes,
-// crashing the app as soon as an accessibility client (window manager, screen capture,
-// System Events) inspects the window hierarchy.
-//
-// We catch and suppress NSAccessibilityException on accessibilityAttributeValue: for
-// NSView, NSWindow, and NSCell (returning nil instead of uncaught exception),
-// as well as interposing the C entry point NSAccessibilityAttributeValue.
-#define DYLD_INTERPOSE(replacement, replacee) \
-    __attribute__((used)) static struct { const void *replacement; const void *replacee; } _interpose_##replacee \
-    __attribute__((section("__DATA,__interpose"))) = { (const void *)(unsigned long)&replacement, (const void *)(unsigned long)&replacee }
-
-extern id NSAccessibilityAttributeValue(id element, NSString *attribute);
-
-static id devitrify_NSAccessibilityAttributeValue(id element, NSString *attribute) {
-    @try {
-        return NSAccessibilityAttributeValue(element, attribute);
-    } @catch (NSException *ex) {
-        if ([ex.name isEqualToString:@"NSAccessibilityException"]) return nil;
-        @throw;
-    }
-}
-
-DYLD_INTERPOSE(devitrify_NSAccessibilityAttributeValue, NSAccessibilityAttributeValue);
-
 static IMP s_orig_view_attr_value = NULL;
 static id swizzled_view_attributeValue(id self, SEL _cmd, NSString *attribute) {
     @try {
-        return ((id (*)(id, SEL, NSString *))s_orig_view_attr_value)(self, _cmd, attribute);
+        return s_orig_view_attr_value ? ((id (*)(id, SEL, NSString *))s_orig_view_attr_value)(self, _cmd, attribute) : nil;
     } @catch (NSException *ex) {
         if ([ex.name isEqualToString:@"NSAccessibilityException"]) return nil;
         @throw;
@@ -457,7 +502,7 @@ static id swizzled_view_attributeValue(id self, SEL _cmd, NSString *attribute) {
 static IMP s_orig_win_attr_value = NULL;
 static id swizzled_win_attributeValue(id self, SEL _cmd, NSString *attribute) {
     @try {
-        return ((id (*)(id, SEL, NSString *))s_orig_win_attr_value)(self, _cmd, attribute);
+        return s_orig_win_attr_value ? ((id (*)(id, SEL, NSString *))s_orig_win_attr_value)(self, _cmd, attribute) : nil;
     } @catch (NSException *ex) {
         if ([ex.name isEqualToString:@"NSAccessibilityException"]) return nil;
         @throw;
@@ -467,7 +512,7 @@ static id swizzled_win_attributeValue(id self, SEL _cmd, NSString *attribute) {
 static IMP s_orig_cell_attr_value = NULL;
 static id swizzled_cell_attributeValue(id self, SEL _cmd, NSString *attribute) {
     @try {
-        return ((id (*)(id, SEL, NSString *))s_orig_cell_attr_value)(self, _cmd, attribute);
+        return s_orig_cell_attr_value ? ((id (*)(id, SEL, NSString *))s_orig_cell_attr_value)(self, _cmd, attribute) : nil;
     } @catch (NSException *ex) {
         if ([ex.name isEqualToString:@"NSAccessibilityException"]) return nil;
         @throw;
@@ -476,7 +521,7 @@ static id swizzled_cell_attributeValue(id self, SEL _cmd, NSString *attribute) {
 
 static IMP s_orig_cell_attributeNames = NULL;
 static NSArray *swizzled_cell_attributeNames(id self, SEL _cmd) {
-    NSArray *names = ((NSArray *(*)(id, SEL))s_orig_cell_attributeNames)(self, _cmd);
+    NSArray *names = s_orig_cell_attributeNames ? ((NSArray *(*)(id, SEL))s_orig_cell_attributeNames)(self, _cmd) : nil;
     if (names && ![names containsObject:NSAccessibilitySubroleAttribute]) names = [names arrayByAddingObject:NSAccessibilitySubroleAttribute];
     return names;
 }
@@ -489,19 +534,87 @@ static void dv_installCompatibilityAccessibilityFix(void) {
     if (cls) dv_swizzle(cls, @selector(accessibilityAttributeNames), (IMP)swizzled_cell_attributeNames, &s_orig_cell_attributeNames);
 }
 
+#pragma mark - Live State Refresh on Hot-Reload
+
+static void dv_refreshSubviewsRecursively(NSView *v, BOOL solariumOn) {
+    if (!v) return;
+    if (!solariumOn) {
+        if ([v isKindOfClass:NSClassFromString(@"NSGlassEffectView")]) {
+            dv_updateFrostedBackdrop(v);
+            v.needsLayout = YES;
+        }
+    }
+    CALayer *layer = v.layer;
+    if (layer && layer.filters.count > 0) {
+        for (id f in layer.filters) dv_neutralizeGlassFilter(f);
+        layer.filters = [layer.filters copy];
+    }
+    for (NSView *sub in v.subviews) {
+        dv_refreshSubviewsRecursively(sub, solariumOn);
+    }
+}
+
+static void dv_refreshLiveWindows(BOOL solariumOn) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            dv_refreshLiveWindows(solariumOn);
+        });
+        return;
+    }
+    for (NSWindow *win in [NSApp windows]) {
+        dv_refreshSubviewsRecursively(win.contentView, solariumOn);
+    }
+}
+
+#pragma mark - Hot-Reload Listener
+
+static void dv_performHotReload(void) {
+    NSString *currentPath = [NSString stringWithContentsOfFile:@"/Users/Shared/.devitrify/reload/current"
+                                                      encoding:NSUTF8StringEncoding
+                                                         error:nil];
+    if (currentPath) {
+        currentPath = [currentPath stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
+    if (!currentPath || currentPath.length == 0) {
+        currentPath = @"/Users/Shared/.devitrify/DevitrifyCore.dylib";
+    }
+    dlopen(currentPath.UTF8String, RTLD_NOW | RTLD_LOCAL);
+}
+
+static void dv_installHotReloadListenerIfNeeded(void) {
+    Class host = [NSApplication class];
+    if (objc_getAssociatedObject(host, @selector(dv_installHotReloadListenerIfNeeded))) return;
+    objc_setAssociatedObject(host, @selector(dv_installHotReloadListenerIfNeeded), @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    int token = 0;
+    notify_register_dispatch("com.aotianneo.devitrify.reload", &token, dispatch_get_main_queue(), ^(int t) {
+        (void)t;
+        dv_performHotReload();
+    });
+}
+
+#pragma mark - Constructor
+
 __attribute__((constructor))
 static void DevitrifyInit(void) {
     @autoreleasepool {
         s_keepsLiquidGlass = dv_keepsLiquidGlassViaLoader();
-        s_liquidGlassOffSystemWide = s_keepsLiquidGlass || !_os_feature_enabled_impl("SwiftUI", "Solarium");
-        if (_os_feature_enabled_impl("SwiftUI", "Solarium")) {
+        BOOL solariumOn = _os_feature_enabled_impl("SwiftUI", "Solarium");
+        s_liquidGlassOffSystemWide = s_keepsLiquidGlass || !solariumOn;
+
+        if (solariumOn) {
             dv_installGlassFilterNeutralization();
             if (dv_keepsLiquidGlassViaLoader() && !dv_compatibilityModeViaLoader()) dv_installClassicAppKit();
             if (dv_compatibilityModeViaLoader()) dv_installCompatibilityAccessibilityFix();
         } else {
             dv_installFrostedGlassFallback();
         }
-        dv_installClassicMenuShadowFix();
+        dv_installClassicMenuEnforcement();
         dv_installKeepLiquidGlassItem();
+        dv_installHotReloadListenerIfNeeded();
+
+        if (NSApp) {
+            dv_refreshLiveWindows(solariumOn);
+        }
     }
 }

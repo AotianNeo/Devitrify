@@ -36,13 +36,23 @@ sudo defaults delete /Library/Preferences/FeatureFlags/Domain/SwiftUI.plist
 defaults delete -g NSAlertGlassSolariumEnabled
 ```
 
-## Tip: Customize the blur radius
-Where Liquid Glass stays on, Devitrify blurs with a radius of 25 points. To change it until you log out, open Terminal and run the following commands, then reopen your apps.
+## Tip: Zero-restart Hot Reload
+You can modify `DevitrifyCore.m` or adjust blur settings and re-apply changes live across all running apps in real-time without restarting them:
 
+```bash
+make reload
+# Or directly run:
+/Users/Shared/.devitrify/devitrify-reload
 ```
-launchctl setenv DEVITRIFY_BLUR_RADIUS 30
-launchctl kickstart -k gui/$(id -u)/com.apple.controlcenter
-launchctl kickstart -k gui/$(id -u)/com.apple.notificationcenterui.agent
+
+This compiles a new generation core dylib, broadcasts the `com.aotianneo.devitrify.reload` Darwin IPC notification to all active Cocoa applications, and updates active window layers and menu caches in-place in <50ms.
+
+## Tip: Customize the blur radius
+Where Liquid Glass stays on, Devitrify blurs with a radius of 25 points. You can change it globally by writing to `/Users/Shared/.devitrify/blur-radius` and running `make reload`, or setting `DEVITRIFY_BLUR_RADIUS`:
+
+```bash
+echo 30 > /Users/Shared/.devitrify/blur-radius
+make reload
 ```
 
 ## Tip: Reload apps that are already running
