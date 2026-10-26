@@ -197,14 +197,7 @@ static void keep_liquid_glass_if_listed(const char *dir) {
         }
     }
 
-    // Default: Enable native glass rendering (CHOICE_STABLE) across all apps by default,
-    // completely eliminating the transparent rendering bug without requiring a manual whitelist.
-    // Apps only opt out if explicitly listed with "off" in liquid-glass-apps (blacklist).
-    if (choice == CHOICE_NONE) {
-        choice = CHOICE_STABLE;
-    }
-
-    if (choice != CHOICE_OFF) s_keep_liquid_glass = 1;
+    if (choice == CHOICE_COMPAT || choice == CHOICE_STABLE) s_keep_liquid_glass = 1;
     if (choice == CHOICE_COMPAT) s_compatibility_mode = 1;
 }
 

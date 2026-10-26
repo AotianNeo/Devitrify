@@ -317,10 +317,34 @@ static void dv_installFrostedGlassFallback(void) {
     }
 }
 
+// StyleMask bit 36 (0x1000000000) designates a glass-effect-backed window (e.g. _NSAlertPanel).
+// When Solarium is off, AppKit's +[NSWindow _validateStyleMask:] normally clears bit 36,
+// stripping the native _NSGlassEffectWindow backdrop and leaving the alert transparent.
+// Preserving bit 36 ensures AppKit attaches the backdrop without turning on Solarium system-wide.
+static IMP s_orig_class_validateStyleMask = NULL;
+static NSUInteger swizzled_class_validateStyleMask(id self, SEL _cmd, NSUInteger mask) {
+    NSUInteger res = s_orig_class_validateStyleMask ?
+        ((NSUInteger (*)(id, SEL, NSUInteger))s_orig_class_validateStyleMask)(self, _cmd, mask) : mask;
+    if (mask & (1ULL << 36)) res |= (1ULL << 36);
+    return res;
+}
+
+static IMP s_orig_inst_validateStyleMask = NULL;
+static NSUInteger swizzled_inst_validateStyleMask(id self, SEL _cmd, NSUInteger mask) {
+    NSUInteger res = s_orig_inst_validateStyleMask ?
+        ((NSUInteger (*)(id, SEL, NSUInteger))s_orig_inst_validateStyleMask)(self, _cmd, mask) : mask;
+    if (mask & (1ULL << 36)) res |= (1ULL << 36);
+    return res;
+}
+
 // System alert panels, sheets, and dialogs must always have frosted glass backdrops
 // across all Solarium modes (even when Solarium is enabled, NSAlertGlassSolariumEnabled is off
 // and NSGlassView renders no layer).
 static void dv_installAlertAndFrameBackdropFallback(void) {
+    Class winCls = [NSWindow class];
+    dv_swizzleClassMethod(winCls, @selector(_validateStyleMask:), (IMP)swizzled_class_validateStyleMask, &s_orig_class_validateStyleMask);
+    dv_swizzle(winCls, @selector(_validateStyleMask:), (IMP)swizzled_inst_validateStyleMask, &s_orig_inst_validateStyleMask);
+
     Class themeFrameCls = NSClassFromString(@"NSThemeFrame");
     if (themeFrameCls) {
         dv_swizzle(themeFrameCls, @selector(layout), (IMP)swizzled_theme_layout, &s_orig_theme_layout);
