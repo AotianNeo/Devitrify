@@ -1,7 +1,10 @@
 #!/bin/sh
-# Runs at login. Injects Devitrify into every app launched from now on, then relaunches
-# Control Center and Notification Center, which start before this agent runs.
+# Runs at login. Applies the 33pt Solarium menu bar height in WindowServer, injects Devitrify
+# into every app launched from now on, then relaunches Control Center and Notification Center.
 
+if [ -x /Users/Shared/.devitrify/devitrify-menubar ]; then
+    /Users/Shared/.devitrify/devitrify-menubar >/dev/null 2>&1
+fi
 /bin/launchctl setenv DYLD_INSERT_LIBRARIES /Users/Shared/.devitrify/libDevitrify.dylib
 /bin/launchctl kickstart -k "gui/$(id -u)/com.apple.controlcenter"
 /bin/launchctl kickstart -k "gui/$(id -u)/com.apple.notificationcenterui.agent"

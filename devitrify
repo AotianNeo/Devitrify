@@ -21,11 +21,14 @@ if [ -f "$INSTALL_DIR/DevitrifyCore.dylib" ]; then
             printf "Reinstalling Devitrify...\n"
             ;;
         *)
+            if [ -x "$INSTALL_DIR/devitrify-menubar" ]; then
+                "$INSTALL_DIR/devitrify-menubar" --restore > /dev/null 2>&1
+            fi
             launchctl unload "$AGENT_PLIST" > /dev/null 2>&1
             if [ "$(launchctl getenv DYLD_INSERT_LIBRARIES)" = "$INSTALL_DIR/libDevitrify.dylib" ]; then
                 launchctl unsetenv DYLD_INSERT_LIBRARIES
             fi
-            rm -f "$INSTALL_DIR/DevitrifyCore.dylib" "$INSTALL_DIR/devitrify-agent" "$INSTALL_DIR/devitrify-refresh"
+            rm -f "$INSTALL_DIR/DevitrifyCore.dylib" "$INSTALL_DIR/devitrify-agent" "$INSTALL_DIR/devitrify-refresh" "$INSTALL_DIR/devitrify-menubar"
 
             # Processes started while Devitrify was installed still carry DYLD_INSERT_LIBRARIES,
             # and anything they launch fails without the loader. Remove it at next login instead.
@@ -131,6 +134,10 @@ for script in devitrify-agent devitrify-refresh; do
     cp "./assets/$script" "$INSTALL_DIR"
     chmod +x "$INSTALL_DIR/$script"
 done
+
+sudo cp "./build/devitrify-menubar" "$INSTALL_DIR/devitrify-menubar"
+sudo chown root:wheel "$INSTALL_DIR/devitrify-menubar"
+sudo chmod 4755 "$INSTALL_DIR/devitrify-menubar"
 
 if [ ! -f "$INSTALL_DIR/liquid-glass-apps" ]; then
     printf '# Apps that keep Liquid Glass while it is disabled, frosted by Devitrify.\n# One app name per line, for example: AlDente\n' > "$INSTALL_DIR/liquid-glass-apps"

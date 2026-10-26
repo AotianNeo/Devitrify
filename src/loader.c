@@ -147,6 +147,11 @@ static int choice_from_text(const char *text) {
 }
 
 static void keep_liquid_glass_if_listed(const char *dir) {
+    // Processes that already have Solarium enabled (system-wide or via FEATUREFLAGS_ENABLED,
+    // such as ControlCenter and NotificationCenter) must not be forced into macOS 15 SDK
+    // compatibility mode.
+    if (_os_feature_enabled_impl("SwiftUI", "Solarium")) return;
+
     char executable[PATH_MAX];
     uint32_t size = sizeof(executable);
     if (_NSGetExecutablePath(executable, &size) != 0 || !strstr(executable, ".app/Contents/MacOS/")) return;
@@ -188,8 +193,12 @@ static void keep_liquid_glass_if_listed(const char *dir) {
         if (file) fclose(file);
     }
 
-    // Without a choice, apps that use SwiftUI's glass effect get the compatibility mode.
-    if (choice == CHOICE_NONE && executable_uses_glass_effect(executable)) choice = CHOICE_COMPAT;
+    // Without a choice, apps (excluding CoreServices system daemons) that use SwiftUI's glass
+    // effect get the compatibility mode.
+    if (choice == CHOICE_NONE && !strstr(executable, "/System/Library/CoreServices/") &&
+        executable_uses_glass_effect(executable)) {
+        choice = CHOICE_COMPAT;
+    }
 
     if (choice == CHOICE_COMPAT || choice == CHOICE_STABLE) s_keep_liquid_glass = 1;
     if (choice == CHOICE_COMPAT) s_compatibility_mode = 1;
