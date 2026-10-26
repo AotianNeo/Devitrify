@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <dlfcn.h>
 #import <notify.h>
 
@@ -176,17 +177,41 @@ static void dv_updateFrostedBackdrop(NSView *glass) {
     [fx setCornerRadius:dv_clampedCornerRadius([[glass valueForKey:@"cornerRadius"] doubleValue], glass.bounds)];
 }
 
-// System alert panels, sheets, and dialogs use NSGlassContentFrameView as their root themeFrame,
-// which becomes completely transparent when Solarium is disabled. We add a frosted backdrop
-// behind the frame content, matching the window's alert shape and corner radius.
+// If an alert or panel does not have native Solarium glass window support,
+// we add a frosted backdrop behind the frame content as fallback.
+// When native Solarium is active (NSGlassContentFrameView / _glassEffectChildWindow),
+// native macOS Liquid Glass renders the alert backdrop cleanly.
 static void dv_updateFrameBackdrop(NSView *frameView) {
     if (!frameView) return;
     NSWindow *win = frameView.window;
     if (!win) return;
 
-    BOOL isTarget = [NSStringFromClass([frameView class]) containsString:@"GlassContentFrame"] ||
-                    [NSStringFromClass([win class]) containsString:@"Alert"];
-    if (!isTarget) return;
+    BOOL isGlassFrame = [NSStringFromClass([frameView class]) containsString:@"GlassContentFrame"];
+    BOOL isAlert = [NSStringFromClass([win class]) containsString:@"Alert"];
+    if (!isGlassFrame && !isAlert) return;
+
+    // Check if native Solarium glass window or backing view is active
+    BOOL hasNativeGlass = NO;
+    if ([win respondsToSelector:@selector(_glassEffectChildWindow)]) {
+        if (((id (*)(id, SEL))objc_msgSend)(win, @selector(_glassEffectChildWindow)) != nil) {
+            hasNativeGlass = YES;
+        }
+    }
+    if (!hasNativeGlass && [frameView respondsToSelector:NSSelectorFromString(@"backingGlassEffectView")]) {
+        if (((id (*)(id, SEL))objc_msgSend)(frameView, NSSelectorFromString(@"backingGlassEffectView")) != nil) {
+            hasNativeGlass = YES;
+        }
+    }
+
+    if (hasNativeGlass || isGlassFrame) {
+        // Native Solarium is active for this alert; remove artificial fallback backdrop if present
+        NSVisualEffectView *existing = (NSVisualEffectView *)dv_frostedBackdropForGlass(frameView);
+        if (existing) {
+            [existing removeFromSuperview];
+            dv_setFrostedBackdropForGlass(frameView, nil);
+        }
+        return;
+    }
 
     NSVisualEffectView *fx = (NSVisualEffectView *)dv_frostedBackdropForGlass(frameView);
     if (!fx) {
@@ -252,11 +277,11 @@ static void swizzled_container_layout(NSView *self, SEL _cmd) {
 
 static IMP s_orig_alert_doOrderWindow = NULL;
 static void swizzled_alert_doOrderWindow(NSWindow *self, SEL _cmd, NSInteger order) {
-    if (self.contentView.superview) {
-        dv_updateFrameBackdrop(self.contentView.superview);
-    }
     if (s_orig_alert_doOrderWindow) {
         ((void (*)(id, SEL, NSInteger))s_orig_alert_doOrderWindow)(self, _cmd, order);
+    }
+    if (self.contentView.superview) {
+        dv_updateFrameBackdrop(self.contentView.superview);
     }
 }
 
@@ -311,10 +336,12 @@ static void dv_installAlertAndFrameBackdropFallback(void) {
 static IMP s_orig_boolForKey = NULL;
 static BOOL swizzled_boolForKey(NSUserDefaults *self, SEL _cmd, NSString *key) {
     if ([key hasPrefix:@"NSGlassMenu"] ||
-        [key isEqualToString:@"NSMenuUseGlassWindowStyle"] ||
-        [key isEqualToString:@"NSAlertGlassSolariumEnabled"] ||
-        [key isEqualToString:@"NSAlertUseGlassWindowStyle"]) {
+        [key isEqualToString:@"NSMenuUseGlassWindowStyle"]) {
         return NO;
+    }
+    if ([key isEqualToString:@"NSAlertGlassSolariumEnabled"] ||
+        [key isEqualToString:@"NSAlertUseGlassWindowStyle"]) {
+        return YES;
     }
     return s_orig_boolForKey ? ((BOOL (*)(id, SEL, NSString *))s_orig_boolForKey)(self, _cmd, key) : NO;
 }
@@ -338,8 +365,8 @@ static void dv_installClassicMenuEnforcement(void) {
         @"NSMenuUseGlassWindowStyle": @NO,
         @"NSGlassMenusUsePlainBorderView": @NO,
         @"NSGlassMenuContentAboveGlass": @NO,
-        @"NSAlertGlassSolariumEnabled": @NO,
-        @"NSAlertUseGlassWindowStyle": @NO,
+        @"NSAlertGlassSolariumEnabled": @YES,
+        @"NSAlertUseGlassWindowStyle": @YES,
     }];
 }
 
@@ -710,8 +737,9 @@ static void DevitrifyInit(void) {
         BOOL solariumOn = _os_feature_enabled_impl("SwiftUI", "Solarium");
         s_liquidGlassOffSystemWide = s_keepsLiquidGlass || !solariumOn;
 
+        dv_installGlassFilterNeutralization();
+
         if (solariumOn) {
-            dv_installGlassFilterNeutralization();
             if (dv_keepsLiquidGlassViaLoader() && !dv_compatibilityModeViaLoader()) dv_installClassicAppKit();
             if (dv_compatibilityModeViaLoader()) dv_installCompatibilityAccessibilityFix();
         } else {

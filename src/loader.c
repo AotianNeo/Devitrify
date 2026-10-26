@@ -50,7 +50,10 @@ int devitrify_compatibility_mode(void) {
 extern bool _os_feature_enabled_impl(const char *domain, const char *feature);
 
 static bool devitrify_feature_enabled(const char *domain, const char *feature) {
-    if (s_keep_liquid_glass && domain && feature && !strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) return true;
+    if (domain && feature) {
+        if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "flexiGlassMacOS")) return true;
+        if (s_keep_liquid_glass && !strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) return true;
+    }
     return _os_feature_enabled_impl(domain, feature);
 }
 

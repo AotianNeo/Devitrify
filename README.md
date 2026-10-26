@@ -24,8 +24,9 @@ Devitrify is meant to be used with Liquid Glass disabled. To disable Liquid Glas
 ```
 sudo mkdir -p /Library/Preferences/FeatureFlags/Domain
 sudo defaults write /Library/Preferences/FeatureFlags/Domain/SwiftUI.plist Solarium -dict Enabled -bool false
-defaults write -g NSAlertGlassSolariumEnabled -bool false
 ```
+
+Devitrify automatically activates native Solarium glass window style specifically and exclusively for alert dialogs (`NSAlert` / `_NSAlertPanel`) with clean Gaussian frosted blur, while enforcing 100% classic menus with shadows across the system.
 
 Control Center and Notification Center don't work correctly with Liquid Glass disabled. [launchbad-revived](https://github.com/nfzerox/launchbad-revived) relaunches them with Liquid Glass enabled, and Devitrify turns their glass into frosted blur.
 
