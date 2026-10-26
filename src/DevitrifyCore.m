@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
 #import <dlfcn.h>
 
 @interface CAFilter : NSObject
@@ -150,6 +151,73 @@ static void dv_installFrostedGlassFallback(void) {
     dv_swizzle(glassCls, @selector(viewDidMoveToWindow), (IMP)swizzled_glass_viewDidMoveToWindow, &s_orig_glass_viewDidMoveToWindow);
     dv_swizzle(glassCls, @selector(setCornerRadius:), (IMP)swizzled_glass_setCornerRadius, &s_orig_glass_setCornerRadius);
     dv_swizzle(glassCls, @selector(setStyle:), (IMP)swizzled_glass_setStyle, &s_orig_glass_setStyle);
+}
+
+#pragma mark - Always-on modern Solarium menus
+
+@interface NSWindow (DVPopupMenuWindowPrivate)
+- (void)_setCornerRadius:(CGFloat)radius;
+@end
+
+@interface NSObject (DVRevealMenuItemPrivate)
+- (NSInteger)tagForType;
+@end
+
+static IMP s_orig_popup_initWithContextMenuImpl = NULL;
+static id swizzled_popup_initWithContextMenuImpl(NSWindow *self, SEL _cmd, id impl) {
+    self = ((id (*)(id, SEL, id))s_orig_popup_initWithContextMenuImpl)(self, _cmd, impl);
+    if (self) {
+        if ([self respondsToSelector:@selector(_setCornerRadius:)]) {
+            [self _setCornerRadius:12.0];
+        }
+        [self setBackgroundColor:[NSColor clearColor]];
+        [self setOpaque:NO];
+    }
+    return self;
+}
+
+static IMP s_orig_rvMenuItem_image = NULL;
+static NSImage *swizzled_rvMenuItem_image(id self, SEL _cmd) {
+    if ([self respondsToSelector:@selector(tagForType)] && [self tagForType] == 1) {
+        NSImage *img = [NSImage imageWithSystemSymbolName:@"text.magnifyingglass" accessibilityDescription:nil];
+        if (img) return img;
+    }
+    return s_orig_rvMenuItem_image ? ((NSImage *(*)(id, SEL))s_orig_rvMenuItem_image)(self, _cmd) : nil;
+}
+
+static IMP s_orig_rvTranslateMenuItem_image = NULL;
+static NSImage *swizzled_rvTranslateMenuItem_image(id self, SEL _cmd) {
+    NSImage *img = [NSImage imageWithSystemSymbolName:@"translate" accessibilityDescription:nil];
+    if (img) return img;
+    return s_orig_rvTranslateMenuItem_image ? ((NSImage *(*)(id, SEL))s_orig_rvTranslateMenuItem_image)(self, _cmd) : nil;
+}
+
+static void dv_onRevealImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide) {
+    (void)vmaddr_slide;
+    Dl_info info;
+    if (!dladdr(mh, &info) || !info.dli_fname || !strstr(info.dli_fname, "/Reveal.framework/")) return;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class rvCls = NSClassFromString(@"RVMenuItem");
+        if (rvCls) dv_swizzle(rvCls, @selector(image), (IMP)swizzled_rvMenuItem_image, &s_orig_rvMenuItem_image);
+        Class rvtCls = NSClassFromString(@"RVTranslateMenuItem");
+        if (rvtCls) dv_swizzle(rvtCls, @selector(image), (IMP)swizzled_rvTranslateMenuItem_image, &s_orig_rvTranslateMenuItem_image);
+    });
+}
+
+static void dv_installModernMenus(BOOL solariumEnabled) {
+    if (!solariumEnabled) {
+        [[NSUserDefaults standardUserDefaults] registerDefaults:@{
+            @"NSGlassMenuLayoutEnabled": @YES,
+            @"NSMenuUseGlassWindowStyle": @NO,
+        }];
+        Class popupCls = NSClassFromString(@"NSPopupMenuWindow");
+        if (popupCls) {
+            dv_swizzle(popupCls, NSSelectorFromString(@"initWithContextMenuImpl:"),
+                       (IMP)swizzled_popup_initWithContextMenuImpl, &s_orig_popup_initWithContextMenuImpl);
+        }
+    }
+    _dyld_register_func_for_add_image(dv_onRevealImageAdded);
 }
 
 #pragma mark - Solarium ON: glass filters -> plain Gaussian blur
@@ -480,13 +548,15 @@ static void DevitrifyInit(void) {
     @autoreleasepool {
         s_keepsLiquidGlass = dv_keepsLiquidGlassViaLoader();
         s_liquidGlassOffSystemWide = s_keepsLiquidGlass || !_os_feature_enabled_impl("SwiftUI", "Solarium");
-        if (_os_feature_enabled_impl("SwiftUI", "Solarium")) {
+        BOOL solariumOn = _os_feature_enabled_impl("SwiftUI", "Solarium");
+        if (solariumOn) {
             dv_installGlassFilterNeutralization();
             if (dv_keepsLiquidGlassViaLoader() && !dv_compatibilityModeViaLoader()) dv_installClassicAppKit();
             if (dv_compatibilityModeViaLoader()) dv_installCompatibilityAccessibilityFix();
         } else {
             dv_installFrostedGlassFallback();
         }
+        dv_installModernMenus(solariumOn);
         dv_installKeepLiquidGlassItem();
     }
 }
