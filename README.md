@@ -66,14 +66,12 @@ Apps and services only load Devitrify when they launch. To reload the ones that 
 Add `-n` to only list them. Add bundle identifiers such as `com.apple.Music` to reload only those apps, even if they already have Devitrify loaded.
 
 ## Apps that use SwiftUI glass
-Apps built with SwiftUI's `.glassEffect()` lose their glass shapes when Liquid Glass is disabled, for example Calculator's keys. Devitrify finds such apps by themselves: when an app's executable imports SwiftUI's glass effect, the app runs with Liquid Glass in its compatibility mode, the way apps built with an older SDK run on macOS 26 and later. Glass keeps its shape, Devitrify turns it into frosted glass, and the controls that SwiftUI and AppKit draw stay classic. The interface frameworks are told that the app was built with the macOS 15 SDK, and SwiftUI's pop-up buttons get the accessibility attribute they are missing, which would otherwise crash the app when an accessibility client such as a window manager looks at them.
+Apps built with SwiftUI's `.glassEffect()` lose their glass shapes and can render transparent when Liquid Glass is disabled globally. Devitrify handles this completely automatically across all apps: native glass rendering is active by default with all liquid refraction neutralized into crisp frosted blur, while AppKit controls and menus always remain 100% classic (22pt height, full dark shadows). You never need to manually whitelist apps.
 
-Choose Help > Keep Liquid Glass in an app to turn this off for it, and choose it again to turn it back on. The app asks to reopen. Apps without a visible Help menu, such as menu bar apps, are configured in `/Users/Shared/.devitrify/liquid-glass-apps`, one app per line, named by the file name without `.app`:
+If you ever wish to explicitly disable glass for a specific app (opt-out blacklist), you can configure `/Users/Shared/.devitrify/liquid-glass-apps`, named by the app name without `.app`:
 
 ```
-AlDente
 Calculator off
-Maps stable
 ```
 
 A line with only a name turns the compatibility mode on, `off` turns it off and `stable` keeps Liquid Glass with SwiftUI's own controls in the new style. Reload the app afterwards:

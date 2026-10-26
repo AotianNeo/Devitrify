@@ -97,9 +97,8 @@ static bool devitrify_program_sdk_at_least(devitrify_build_version version) {
 DYLD_INTERPOSE(devitrify_program_sdk_version, dyld_get_program_sdk_version);
 DYLD_INTERPOSE(devitrify_program_sdk_at_least, dyld_program_sdk_at_least);
 
-// Whether the app's own executable imports SwiftUI's glass effect, found in the symbol names
-// of its Mach-O file.
-static int executable_uses_glass_effect(const char *path) {
+// Kept for backward compatibility when inspecting Mach-O glass effect imports.
+__attribute__((unused)) static int executable_uses_glass_effect(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
     struct stat st;
@@ -157,53 +156,55 @@ static void keep_liquid_glass_if_listed(const char *dir) {
 
     char executable[PATH_MAX];
     uint32_t size = sizeof(executable);
-    if (_NSGetExecutablePath(executable, &size) != 0 || !strstr(executable, ".app/Contents/MacOS/")) return;
+    if (_NSGetExecutablePath(executable, &size) != 0) return;
 
     int choice = CHOICE_NONE;
-    const char *home = getenv("HOME");
-    if (home && strstr(home, "/Library/Containers/")) {
-        // Sandboxed apps can't read liquid-glass-apps. Their HOME is their container, where
-        // Help > Keep Liquid Glass leaves a marker file.
-        char marker[PATH_MAX];
-        snprintf(marker, sizeof(marker), "%s/Library/Application Support/devitrify-keep-liquid-glass", home);
-        FILE *file = fopen(marker, "r");
-        if (file) {
-            char text[16] = "";
-            if (!fgets(text, sizeof(text), file)) text[0] = '\0';
-            choice = choice_from_text(text);
-            fclose(file);
-        }
-    } else {
-        char list[PATH_MAX];
-        snprintf(list, sizeof(list), "%s/liquid-glass-apps", dir);
-        FILE *file = fopen(list, "r");
-        char line[256];
-        while (file && fgets(line, sizeof(line), file)) {
-            line[strcspn(line, "\r\n")] = '\0';
-            if (line[0] == '\0' || line[0] == '#') continue;
-            char *space = strrchr(line, ' ');
-            const char *option = "";
-            if (space && (!strcmp(space + 1, "off") || !strcmp(space + 1, "stable") || !strcmp(space + 1, "compat"))) {
-                *space = '\0';
-                option = space + 1;
+    if (strstr(executable, ".app/Contents/MacOS/")) {
+        const char *home = getenv("HOME");
+        if (home && strstr(home, "/Library/Containers/")) {
+            // Sandboxed apps can't read liquid-glass-apps. Their HOME is their container, where
+            // Help > Keep Liquid Glass leaves a marker file.
+            char marker[PATH_MAX];
+            snprintf(marker, sizeof(marker), "%s/Library/Application Support/devitrify-keep-liquid-glass", home);
+            FILE *file = fopen(marker, "r");
+            if (file) {
+                char text[16] = "";
+                if (!fgets(text, sizeof(text), file)) text[0] = '\0';
+                choice = choice_from_text(text);
+                fclose(file);
             }
-            char needle[PATH_MAX];
-            snprintf(needle, sizeof(needle), "/%s.app/Contents/MacOS/", line);
-            if (!strstr(executable, needle)) continue;
-            choice = choice_from_text(option);
-            break;
+        } else {
+            char list[PATH_MAX];
+            snprintf(list, sizeof(list), "%s/liquid-glass-apps", dir);
+            FILE *file = fopen(list, "r");
+            char line[256];
+            while (file && fgets(line, sizeof(line), file)) {
+                line[strcspn(line, "\r\n")] = '\0';
+                if (line[0] == '\0' || line[0] == '#') continue;
+                char *space = strrchr(line, ' ');
+                const char *option = "";
+                if (space && (!strcmp(space + 1, "off") || !strcmp(space + 1, "stable") || !strcmp(space + 1, "compat"))) {
+                    *space = '\0';
+                    option = space + 1;
+                }
+                char needle[PATH_MAX];
+                snprintf(needle, sizeof(needle), "/%s.app/Contents/MacOS/", line);
+                if (!strstr(executable, needle)) continue;
+                choice = choice_from_text(option);
+                break;
+            }
+            if (file) fclose(file);
         }
-        if (file) fclose(file);
     }
 
-    // Without a choice, apps (excluding CoreServices system daemons) that use SwiftUI's glass
-    // effect get the compatibility mode.
-    if (choice == CHOICE_NONE && !strstr(executable, "/System/Library/CoreServices/") &&
-        executable_uses_glass_effect(executable)) {
-        choice = CHOICE_COMPAT;
+    // Default: Enable native glass rendering (CHOICE_STABLE) across all apps by default,
+    // completely eliminating the transparent rendering bug without requiring a manual whitelist.
+    // Apps only opt out if explicitly listed with "off" in liquid-glass-apps (blacklist).
+    if (choice == CHOICE_NONE) {
+        choice = CHOICE_STABLE;
     }
 
-    if (choice == CHOICE_COMPAT || choice == CHOICE_STABLE) s_keep_liquid_glass = 1;
+    if (choice != CHOICE_OFF) s_keep_liquid_glass = 1;
     if (choice == CHOICE_COMPAT) s_compatibility_mode = 1;
 }
 

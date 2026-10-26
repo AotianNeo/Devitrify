@@ -739,12 +739,12 @@ static void DevitrifyInit(void) {
 
         dv_installGlassFilterNeutralization();
 
-        if (solariumOn) {
-            if (dv_keepsLiquidGlassViaLoader() && !dv_compatibilityModeViaLoader()) dv_installClassicAppKit();
-            if (dv_compatibilityModeViaLoader()) dv_installCompatibilityAccessibilityFix();
+        if (!dv_compatibilityModeViaLoader()) {
+            dv_installClassicAppKit();
         } else {
-            dv_installFrostedGlassFallback();
+            dv_installCompatibilityAccessibilityFix();
         }
+        dv_installFrostedGlassFallback();
         dv_installAlertAndFrameBackdropFallback();
         dv_installClassicMenuEnforcement();
         dv_installKeepLiquidGlassItem();
