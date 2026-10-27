@@ -38,6 +38,7 @@ install: all
 	cp build/DevitrifyCore.dylib $(INSTALL_DIR)/DevitrifyCore.dylib.new && mv -f $(INSTALL_DIR)/DevitrifyCore.dylib.new $(INSTALL_DIR)/DevitrifyCore.dylib
 	cp build/devitrify-reload $(INSTALL_DIR)/devitrify-reload.new && mv -f $(INSTALL_DIR)/devitrify-reload.new $(INSTALL_DIR)/devitrify-reload
 	chmod +x $(INSTALL_DIR)/devitrify-reload
+	mv -f $(INSTALL_DIR)/reload/current ~/.Trash/ 2>/dev/null || true
 
 reload: install
 	$(INSTALL_DIR)/devitrify-reload

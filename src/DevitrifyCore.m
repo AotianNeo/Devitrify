@@ -135,9 +135,16 @@ static inline BOOL dv_isGlassFilterType(NSString *type) {
 
 static inline BOOL dv_isRefractionKey(NSString *key) {
     if (!key) return NO;
-    return [key containsString:@"Refraction"] ||
-           [key containsString:@"Bleed"] ||
-           [key containsString:@"Aberration"] ||
+    return [key isEqualToString:@"inputInnerRefractionAmount"] ||
+           [key isEqualToString:@"inputInnerRefractionHeight"] ||
+           [key isEqualToString:@"inputOuterRefractionAmount"] ||
+           [key isEqualToString:@"inputOuterRefractionHeight"] ||
+           [key isEqualToString:@"inputRefractionOpacity"] ||
+           [key isEqualToString:@"inputBleedAmount"] ||
+           [key isEqualToString:@"inputBleedHeight"] ||
+           [key isEqualToString:@"inputBleedOpacity"] ||
+           [key isEqualToString:@"inputAberrationAmount"] ||
+           [key isEqualToString:@"inputAberrationHeight"] ||
            [key isEqualToString:@"inputKeyFillHighlightAmount"] ||
            [key isEqualToString:@"inputKeyFillHighlightHeight"];
 }
@@ -145,7 +152,10 @@ static inline BOOL dv_isRefractionKey(NSString *key) {
 static IMP s_orig_sdf_setEffect = NULL;
 static void swizzled_sdf_setEffect(CALayer *self, SEL _cmd, id effect) {
     if (effect && [NSStringFromClass([effect class]) isEqualToString:@"CASDFKeyFillHighlightEffect"]) {
-        effect = nil;
+        @try {
+            [effect setValue:@0 forKey:@"keyAmount"];
+            [effect setValue:@0 forKey:@"fillAmount"];
+        } @catch (id ex) {}
     }
     if (s_orig_sdf_setEffect) {
         ((void (*)(id, SEL, id))s_orig_sdf_setEffect)(self, _cmd, effect);
@@ -162,7 +172,10 @@ static void dv_neutralizeGlassFilter(id filter) {
             }
         }
         if ([type isEqualToString:@"glassBackground"]) {
-            [filter setValue:@(dv_getGlassBlurRadius()) forKey:@"inputBlurRadius"];
+            id curBlur = [filter valueForKey:@"inputBlurRadius"];
+            if (curBlur && [curBlur doubleValue] > 0.0) {
+                [filter setValue:@(dv_getGlassBlurRadius()) forKey:@"inputBlurRadius"];
+            }
         }
     } @catch (id ex) {}
 }
@@ -182,7 +195,9 @@ static void swizzled_cafilter_setValueForKey(id self, SEL _cmd, id value, NSStri
         if (dv_isRefractionKey(key)) {
             value = @0;
         } else if ([type isEqualToString:@"glassBackground"] && [key isEqualToString:@"inputBlurRadius"]) {
-            value = @(dv_getGlassBlurRadius());
+            if ([value respondsToSelector:@selector(doubleValue)] && [value doubleValue] > 0.0) {
+                value = @(dv_getGlassBlurRadius());
+            }
         }
     }
     if (s_orig_cafilter_setValueForKey) {
@@ -199,10 +214,13 @@ static void swizzled_setFilters(id self, SEL _cmd, NSArray *filters) {
 static IMP s_orig_setValueForKeyPath = NULL;
 static void swizzled_setValueForKeyPath(id self, SEL _cmd, id value, NSString *keyPath) {
     if ([keyPath hasPrefix:@"filters.glass"]) {
-        if (dv_isRefractionKey(keyPath)) {
+        NSString *key = [[keyPath componentsSeparatedByString:@"."] lastObject];
+        if (dv_isRefractionKey(key)) {
             value = @0;
-        } else if ([keyPath hasSuffix:@"inputBlurRadius"]) {
-            value = @(dv_getGlassBlurRadius());
+        } else if ([key isEqualToString:@"inputBlurRadius"]) {
+            if ([value respondsToSelector:@selector(doubleValue)] && [value doubleValue] > 0.0) {
+                value = @(dv_getGlassBlurRadius());
+            }
         }
     }
     if (s_orig_setValueForKeyPath) {
