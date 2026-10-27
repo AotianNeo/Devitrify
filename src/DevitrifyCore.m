@@ -138,7 +138,6 @@ static inline BOOL dv_isRefractionKey(NSString *key) {
     return [key containsString:@"Refraction"] ||
            [key containsString:@"Bleed"] ||
            [key containsString:@"Aberration"] ||
-           [key containsString:@"Shadow"] ||
            [key isEqualToString:@"inputKeyFillHighlightAmount"] ||
            [key isEqualToString:@"inputKeyFillHighlightHeight"];
 }
