@@ -19,25 +19,24 @@
 #include <string.h>
 #include <unistd.h>
 
-static int appkit_is_loaded(void) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "/AppKit.framework/")) return 1;
-    }
-    return 0;
-}
-
-// Apps named in liquid-glass-apps (one app name per line, e.g. "AlDente") keep Liquid
-// Glass while it is disabled system-wide, so their SwiftUI glass keeps its shape and
-// DevitrifyCore turns it into frosted glass. DevitrifyCore asks the loader whether the
-// app is one of them to keep the app's AppKit controls classic.
-// Set when the app keeps Liquid Glass. The feature flag lookup below answers "enabled" for
-// Liquid Glass in such apps; no environment variable is touched, and because dyld applies
-// the interposition when it loads the images, it holds before anything reads or caches the flag.
 static int s_keep_liquid_glass = 0;
 static int s_compatibility_mode = 0;
 static int s_appkit_loaded = 0;
+static int s_needs_full_swiftui_solarium = 0;
+
+static void detect_loaded_frameworks(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        if (strstr(name, "/AppKit.framework/")) s_appkit_loaded = 1;
+        if (strstr(name, "/SpotlightUIInternal.framework/") ||
+            strstr(name, "/UIKitCore.framework/") ||
+            strstr(name, "/UIKitMacHelper.framework/")) {
+            s_needs_full_swiftui_solarium = 1;
+        }
+    }
+}
 
 int devitrify_keeps_liquid_glass(void) {
     return s_keep_liquid_glass;
@@ -66,13 +65,21 @@ static bool devitrify_caller_is_swift_feature_flags(const void *address) {
            strstr(info.dli_fname, "FeatureFlags") != NULL;
 }
 
+static bool devitrify_caller_is_uikit_core(const void *address) {
+    Dl_info info;
+    if (!dladdr(address, &info) || !info.dli_fname) return false;
+    return strstr(info.dli_fname, "/UIKitCore.framework/") != NULL;
+}
+
 static bool devitrify_feature_enabled(const char *domain, const char *feature) {
     if (domain && feature) {
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "flexiGlassMacOS")) return true;
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) {
+            const void *ret = __builtin_return_address(0);
             if (s_keep_liquid_glass) return true;
-            if (s_appkit_loaded && devitrify_caller_is_swift_feature_flags(__builtin_return_address(0))) {
-                s_in_solarium_compute_values = 1;
+            if (s_appkit_loaded && devitrify_caller_is_uikit_core(ret)) return true;
+            if (s_appkit_loaded && devitrify_caller_is_swift_feature_flags(ret)) {
+                if (!s_needs_full_swiftui_solarium) s_in_solarium_compute_values = 1;
                 return true;
             }
         }
@@ -245,9 +252,9 @@ static void devitrify_load_core(void) {
     if (!slash) return;
     *slash = '\0';
     keep_liquid_glass_if_listed(path);
+    detect_loaded_frameworks();
 
-    if (!appkit_is_loaded()) return;
-    s_appkit_loaded = 1;
+    if (!s_appkit_loaded) return;
 
     // Check if a hot-reloaded core generation is active
     char reload_path[PATH_MAX];
