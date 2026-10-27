@@ -16,25 +16,24 @@ This has been tested on macOS Golden Gate 27.2. The script checks that the `amfi
 To uninstall, run `~/Downloads/Devitrify-main/devitrify` again, then log out and back in. To clear the boot argument change, run `sudo nvram -d boot-args`.
 
 ## Screenshot
+<img width="1920" alt="Devitrify frosted glass showcase across Calculator, System Alert, Spotlight, and Control Center with Solarium disabled" src="assets/showcase.png" />
+
 <img width="1920" alt="The same glass panel with Liquid Glass, with Liquid Glass disabled, and with Liquid Glass disabled plus Devitrify" src="assets/screenshot.png" />
 
 ## Tip: Disable Liquid Glass
-Devitrify is meant to be used with Liquid Glass disabled. To disable Liquid Glass, open Terminal and run the following command. You won't see your password as you type. Changes take effect after restart.
+Devitrify is meant to be used with Liquid Glass (`SwiftUI/Solarium`) disabled system-wide. To disable Liquid Glass, open Terminal and run the following command. You won't see your password as you type. Changes take effect after restart.
 
-```
+```bash
 sudo mkdir -p /Library/Preferences/FeatureFlags/Domain
 sudo defaults write /Library/Preferences/FeatureFlags/Domain/SwiftUI.plist Solarium -dict Enabled -bool false
 ```
 
-Devitrify automatically activates native Solarium glass window style specifically and exclusively for alert dialogs (`NSAlert` / `_NSAlertPanel`) with clean Gaussian frosted blur, while enforcing 100% classic menus with shadows across the system.
-
-Control Center and Notification Center don't work correctly with Liquid Glass disabled. [launchbad-revived](https://github.com/nfzerox/launchbad-revived) relaunches them with Liquid Glass enabled, and Devitrify turns their glass into frosted blur.
+With `Solarium` disabled system-wide, Devitrify automatically keeps all system components (`ControlCenter`, `NotificationCenter`, `Spotlight` / `Siri AI`, `NSAlert` dialogs, SwiftUI `.glassEffect()` apps like `Calculator`, and Mac Catalyst apps like `FindMy`) working out of the box with classic window chrome, native drop shadows, and uniform Gaussian frosted blur—without requiring per-process `FEATUREFLAGS_ENABLED=SwiftUI/Solarium` overrides.
 
 To re-enable Liquid Glass, open Terminal and run the following command. Changes take effect after restart.
 
-```
+```bash
 sudo defaults delete /Library/Preferences/FeatureFlags/Domain/SwiftUI.plist
-defaults delete -g NSAlertGlassSolariumEnabled
 ```
 
 ## Tip: Zero-restart Hot Reload
@@ -87,15 +86,16 @@ echo off > ~/Library/Containers/com.apple.calculator/Data/Library/Application\ S
 ```
 
 ## How it works
-- `libDevitrify.dylib` is injected into every process through `DYLD_INSERT_LIBRARIES`. It links nothing beyond libSystem and loads `DevitrifyCore.dylib` only into processes that already have AppKit loaded, so command-line tools are unaffected. For apps that use SwiftUI glass, found in the symbol table of their executable, or that are named in `liquid-glass-apps` (for sandboxed apps: with a marker file in their container), the loader makes the system's feature flag lookup (`_os_feature_enabled_impl`) answer that Liquid Glass is enabled. No environment variable is changed, and the answer holds from the start of the process because dyld applies the interposition when it loads the images.
-- In apps named in `liquid-glass-apps`, AppKit is told that Liquid Glass is off, so their windows, menus and controls are drawn exactly like with Liquid Glass disabled. SwiftUI glass and `NSGlassEffectView` follow SwiftUI's own flag and keep their glass.
-- `devitrify-menubar` keeps the compact 33-point notched menu bar height in `WindowServer` while Liquid Glass (`SwiftUI/Solarium`) is disabled system-wide, dynamically resolving `SkyLight.framework` instructions without hardcoded offsets so it remains effective across macOS updates.
-- With Liquid Glass disabled, every `NSGlassEffectView` in an app window gets an `NSVisualEffectView` behind its content, clipped to the glass corner radius. Regular glass uses the popover material and clear glass the HUD material. Glass that fills its window blurs the desktop; glass inside a window blurs the window's content. Glass in AppKit's own windows, such as menus, is left alone because AppKit already draws it correctly.
-- With Liquid Glass enabled, the `glassBackground` and `glassForeground` filters lose their refraction, edge bleed, chromatic aberration and shadow.
+- `libDevitrify.dylib` is injected into every process through `DYLD_INSERT_LIBRARIES`. It links nothing beyond `libSystem` and loads `DevitrifyCore.dylib` only into GUI processes that link `AppKit`, so command-line tools are unaffected.
+- At image load time, `libDevitrify.dylib` hooks `SwiftUICore`'s `Solarium.computeValues()` (the single source of truth for SwiftUI glass enablement) to upgrade `.off (0)` to `.compatibility (1)` across all desktop apps, `ControlCenter`, and `NotificationCenter`. In `.compatibility (1)` mode, SwiftUI's `Solarium.isCompatibilityEnabled(.mac)` returns `true` so `.glassEffect()`, `.buttonStyle(.glass)`, and `ControlCenter` / `NotificationCenter` `CABackdropLayer` trees remain intact, while `Solarium.isEnabled(.mac)` returns `false` so window toolbars and navigation chrome stay classic.
+- For processes that require full `Solarium` semantics to construct their view hierarchy (`SpotlightUIInternal` / `Siri AI` and Mac Catalyst `UIKitCore` apps such as `FindMy`), the loader resolves `_os_feature_enabled_impl("SwiftUI", "Solarium")` to `true` while `DevitrifyCore.dylib` swizzles `AppKit`'s `_NSSolariumEnabled` to `false` (except inside `NSAlert` / `_NSAlertPanel` init frames, preserving native alert glass and drop shadows).
+- Inside `QuartzCore`, `DevitrifyCore.dylib` intercepts `CAFilter` and `CASDFKeyFillHighlightEffect`:
+  - `glassBackground` and `glassForeground` have their refraction (`inputLensingPower`, `inputRefractionHeight`), edge bleed (`inputBleedAmount`), and chromatic aberration (`inputAbberation` / `inputChromaticAberration`) zeroed out, with `inputBlurRadius` set to a uniform Gaussian frosted blur (`25pt` by default) while preserving native `inputShadow*` parameters.
+  - `CASDFKeyFillHighlightEffect` has its `keyColor` and `fillColor` neutralized to `kCGColorClear` (`rgba(0,0,0,0)`), eliminating the 3D specular Liquid Glass rim across SwiftUI and `ControlCenter` tiles without breaking `CA::Render::SDFLayer` validation.
+- For AppKit `NSGlassEffectView` instances when `_NSSolariumEnabled` is `false`, `DevitrifyCore.dylib` inserts an `NSVisualEffectView` clipped to the glass corner radius (`BehindWindow` for root glass views, `WithinWindow` for nested controls).
+- `devitrify-menubar` keeps the compact 33-point notched menu bar height in `WindowServer` while `SwiftUI/Solarium` is disabled system-wide, dynamically resolving `SkyLight.framework` instructions without hardcoded offsets so it remains effective across macOS updates.
 
 ## Limitations
-- The tint color of `NSGlassEffectView` isn't reproduced.
-- SwiftUI's `.glassEffect()` and `.buttonStyle(.glass)` don't use `NSGlassEffectView`. With Liquid Glass disabled they draw only their content. Devitrify can't turn them into frosted glass directly; keep Liquid Glass for those apps instead.
-- Some apps crash at launch with Liquid Glass disabled, for example FindMy, which uses SwiftUI glass. Compatibility mode does not prevent the crash; opening it with `open -a FindMy --env FEATUREFLAGS_ENABLED=SwiftUI/Solarium` does.
+- The custom tint color of `NSGlassEffectView` is approximated using standard `NSVisualEffectView` materials when `_NSSolariumEnabled` is `false`.
 - Apps restored at login before the login agent runs start without Devitrify until they are reopened, for example with `devitrify-refresh`.
 - Sandboxed app extensions, such as the panes of System Settings, don't load Devitrify. They don't need it: with Liquid Glass disabled they already draw classic controls.

@@ -150,11 +150,28 @@ static inline BOOL dv_isRefractionKey(NSString *key) {
 }
 
 static IMP s_orig_sdf_setEffect = NULL;
+static IMP s_orig_sdf_effect_setKeyColor = NULL;
+static IMP s_orig_sdf_effect_setFillColor = NULL;
+
+static void swizzled_sdf_effect_setKeyColor(id self, SEL _cmd, CGColorRef color) {
+    (void)color;
+    if (s_orig_sdf_effect_setKeyColor) {
+        ((void (*)(id, SEL, CGColorRef))s_orig_sdf_effect_setKeyColor)(self, _cmd, CGColorGetConstantColor(kCGColorClear));
+    }
+}
+
+static void swizzled_sdf_effect_setFillColor(id self, SEL _cmd, CGColorRef color) {
+    (void)color;
+    if (s_orig_sdf_effect_setFillColor) {
+        ((void (*)(id, SEL, CGColorRef))s_orig_sdf_effect_setFillColor)(self, _cmd, CGColorGetConstantColor(kCGColorClear));
+    }
+}
+
 static void swizzled_sdf_setEffect(CALayer *self, SEL _cmd, id effect) {
     if (effect && [NSStringFromClass([effect class]) isEqualToString:@"CASDFKeyFillHighlightEffect"]) {
         @try {
-            [effect setValue:@0 forKey:@"keyAmount"];
-            [effect setValue:@0 forKey:@"fillAmount"];
+            [effect setValue:(__bridge id)CGColorGetConstantColor(kCGColorClear) forKey:@"keyColor"];
+            [effect setValue:(__bridge id)CGColorGetConstantColor(kCGColorClear) forKey:@"fillColor"];
         } @catch (id ex) {}
     }
     if (s_orig_sdf_setEffect) {
@@ -172,10 +189,7 @@ static void dv_neutralizeGlassFilter(id filter) {
             }
         }
         if ([type isEqualToString:@"glassBackground"]) {
-            id curBlur = [filter valueForKey:@"inputBlurRadius"];
-            if (curBlur && [curBlur doubleValue] > 0.0) {
-                [filter setValue:@(dv_getGlassBlurRadius()) forKey:@"inputBlurRadius"];
-            }
+            [filter setValue:@(dv_getGlassBlurRadius()) forKey:@"inputBlurRadius"];
         }
     } @catch (id ex) {}
 }
@@ -195,9 +209,7 @@ static void swizzled_cafilter_setValueForKey(id self, SEL _cmd, id value, NSStri
         if (dv_isRefractionKey(key)) {
             value = @0;
         } else if ([type isEqualToString:@"glassBackground"] && [key isEqualToString:@"inputBlurRadius"]) {
-            if ([value respondsToSelector:@selector(doubleValue)] && [value doubleValue] > 0.0) {
-                value = @(dv_getGlassBlurRadius());
-            }
+            value = @(dv_getGlassBlurRadius());
         }
     }
     if (s_orig_cafilter_setValueForKey) {
@@ -237,6 +249,11 @@ static void dv_installGlassFilterNeutralization(void) {
     Class sdfCls = NSClassFromString(@"CASDFLayer");
     if (sdfCls) {
         dv_swizzle(sdfCls, NSSelectorFromString(@"setEffect:"), (IMP)swizzled_sdf_setEffect, &s_orig_sdf_setEffect);
+    }
+    Class sdfEffCls = NSClassFromString(@"CASDFKeyFillHighlightEffect");
+    if (sdfEffCls) {
+        dv_swizzle(sdfEffCls, NSSelectorFromString(@"setKeyColor:"), (IMP)swizzled_sdf_effect_setKeyColor, &s_orig_sdf_effect_setKeyColor);
+        dv_swizzle(sdfEffCls, NSSelectorFromString(@"setFillColor:"), (IMP)swizzled_sdf_effect_setFillColor, &s_orig_sdf_effect_setFillColor);
     }
     dv_swizzle([CALayer class], @selector(setFilters:), (IMP)swizzled_setFilters, &s_orig_setFilters);
     dv_swizzle([CALayer class], @selector(setValue:forKeyPath:), (IMP)swizzled_setValueForKeyPath, &s_orig_setValueForKeyPath);
@@ -443,6 +460,12 @@ static void dv_installCompatibilityAccessibilityFix(void) {
 
 static void dv_refreshLayersRecursively(CALayer *layer) {
     if (!layer) return;
+    if ([NSStringFromClass([layer class]) isEqualToString:@"CASDFLayer"]) {
+        @try {
+            id eff = [layer valueForKey:@"effect"];
+            if (eff) swizzled_sdf_setEffect(layer, NSSelectorFromString(@"setEffect:"), eff);
+        } @catch (id ex) {}
+    }
     if (layer.filters.count > 0) {
         for (id f in layer.filters) dv_neutralizeGlassFilter(f);
         layer.filters = [layer.filters copy];
