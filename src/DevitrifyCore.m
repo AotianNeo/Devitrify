@@ -423,7 +423,19 @@ static inline BOOL dv_isRefractionKey(NSString *key) {
     return [key containsString:@"Refraction"] ||
            [key containsString:@"Bleed"] ||
            [key containsString:@"Aberration"] ||
-           [key containsString:@"Shadow"];
+           [key containsString:@"Shadow"] ||
+           [key isEqualToString:@"inputKeyFillHighlightAmount"] ||
+           [key isEqualToString:@"inputKeyFillHighlightHeight"];
+}
+
+static IMP s_orig_sdf_setEffect = NULL;
+static void swizzled_sdf_setEffect(CALayer *self, SEL _cmd, id effect) {
+    if (effect && [NSStringFromClass([effect class]) isEqualToString:@"CASDFKeyFillHighlightEffect"]) {
+        effect = nil;
+    }
+    if (s_orig_sdf_setEffect) {
+        ((void (*)(id, SEL, id))s_orig_sdf_setEffect)(self, _cmd, effect);
+    }
 }
 
 static void dv_neutralizeGlassFilter(id filter) {
@@ -490,6 +502,10 @@ static void dv_installGlassFilterNeutralization(void) {
         dv_swizzleClassMethod(filterCls, @selector(filterWithType:), (IMP)swizzled_filterWithType, &s_orig_filterWithType);
         dv_swizzle(filterCls, @selector(setValue:forKey:), (IMP)swizzled_cafilter_setValueForKey, &s_orig_cafilter_setValueForKey);
     }
+    Class sdfCls = NSClassFromString(@"CASDFLayer");
+    if (sdfCls) {
+        dv_swizzle(sdfCls, NSSelectorFromString(@"setEffect:"), (IMP)swizzled_sdf_setEffect, &s_orig_sdf_setEffect);
+    }
     dv_swizzle([CALayer class], @selector(setFilters:), (IMP)swizzled_setFilters, &s_orig_setFilters);
     dv_swizzle([CALayer class], @selector(setValue:forKeyPath:), (IMP)swizzled_setValueForKeyPath, &s_orig_setValueForKeyPath);
 }
@@ -503,7 +519,10 @@ static BOOL dv_returnNo(id self, SEL _cmd) {
 
 static void dv_installClassicAppKit(void) {
     Class cls = NSClassFromString(@"_NSSwiftUICoreFeatureFlags");
-    if (cls) dv_swizzleClassMethod(cls, @selector(isSolariumEnabled), (IMP)dv_returnNo, NULL);
+    if (cls) {
+        dv_swizzleClassMethod(cls, @selector(isSolariumEnabled), (IMP)dv_returnNo, NULL);
+        dv_swizzleClassMethod(cls, NSSelectorFromString(@"isSolariumEnabledIgnoringCompatibility"), (IMP)dv_returnNo, NULL);
+    }
 }
 
 #pragma mark - Help menu: Keep Liquid Glass

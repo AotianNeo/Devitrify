@@ -36,7 +36,7 @@ install: all
 	mkdir -p $(INSTALL_DIR)/reload
 	cp build/libDevitrify.dylib $(INSTALL_DIR)/libDevitrify.dylib.new && mv -f $(INSTALL_DIR)/libDevitrify.dylib.new $(INSTALL_DIR)/libDevitrify.dylib
 	cp build/DevitrifyCore.dylib $(INSTALL_DIR)/DevitrifyCore.dylib.new && mv -f $(INSTALL_DIR)/DevitrifyCore.dylib.new $(INSTALL_DIR)/DevitrifyCore.dylib
-	cp build/devitrify-reload $(INSTALL_DIR)/devitrify-reload
+	cp build/devitrify-reload $(INSTALL_DIR)/devitrify-reload.new && mv -f $(INSTALL_DIR)/devitrify-reload.new $(INSTALL_DIR)/devitrify-reload
 	chmod +x $(INSTALL_DIR)/devitrify-reload
 
 reload: install

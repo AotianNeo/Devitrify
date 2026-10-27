@@ -37,6 +37,7 @@ static int appkit_is_loaded(void) {
 // the interposition when it loads the images, it holds before anything reads or caches the flag.
 static int s_keep_liquid_glass = 0;
 static int s_compatibility_mode = 0;
+static int s_appkit_loaded = 0;
 
 int devitrify_keeps_liquid_glass(void) {
     return s_keep_liquid_glass;
@@ -49,10 +50,32 @@ int devitrify_compatibility_mode(void) {
 
 extern bool _os_feature_enabled_impl(const char *domain, const char *feature);
 
+// When Solarium is disabled system-wide, AppKit and SwiftUI controls must stay classic
+// (Solarium.isEnabled == false, Solarium.useMetrics == false), while explicit .glassEffect(...)
+// views (such as Calculator's keypad buttons) still need DesignLibrary.GlassMaterialProvider
+// to resolve their background layers instead of returning an empty layer array [].
+// SwiftUICore's Solarium.computeValues computes EnablementEntry = { level: .compatibility (1),
+// criteria: 0x5 } when the SwiftUI/Solarium feature flag is true (via libswiftFeatureFlags)
+// and the subsequent Semantics.v7 dyld_program_sdk_at_least check returns false.
+static volatile int s_in_solarium_compute_values = 0;
+
+static bool devitrify_caller_is_swift_feature_flags(const void *address) {
+    Dl_info info;
+    if (!dladdr(address, &info) || !info.dli_fname) return false;
+    return strstr(info.dli_fname, "/SwiftUICore.framework/") != NULL ||
+           strstr(info.dli_fname, "FeatureFlags") != NULL;
+}
+
 static bool devitrify_feature_enabled(const char *domain, const char *feature) {
     if (domain && feature) {
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "flexiGlassMacOS")) return true;
-        if (s_keep_liquid_glass && !strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) return true;
+        if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) {
+            if (s_keep_liquid_glass) return true;
+            if (s_appkit_loaded && devitrify_caller_is_swift_feature_flags(__builtin_return_address(0))) {
+                s_in_solarium_compute_values = 1;
+                return true;
+            }
+        }
     }
     return _os_feature_enabled_impl(domain, feature);
 }
@@ -72,6 +95,12 @@ extern uint32_t dyld_get_program_sdk_version(void);
 extern bool dyld_program_sdk_at_least(devitrify_build_version version);
 
 #define DEVITRIFY_COMPATIBILITY_SDK 0x000F0000
+#define DEVITRIFY_COMPATIBILITY_VERSION_SET 0x07E8FFFF
+
+static bool devitrify_version_after_compat(devitrify_build_version version) {
+    uint32_t limit = (version.platform == 0xFFFFFFFFU) ? DEVITRIFY_COMPATIBILITY_VERSION_SET : DEVITRIFY_COMPATIBILITY_SDK;
+    return version.version > limit;
+}
 
 // Only the frameworks that draw the interface get the older SDK. Other frameworks, such as
 // CoreFoundation, change behavior with the SDK too and misbehave when they are told one that
@@ -90,7 +119,12 @@ static uint32_t devitrify_program_sdk_version(void) {
 }
 
 static bool devitrify_program_sdk_at_least(devitrify_build_version version) {
-    if (s_compatibility_mode && version.version > DEVITRIFY_COMPATIBILITY_SDK && devitrify_caller_draws_interface(__builtin_return_address(0))) return false;
+    if (s_in_solarium_compute_values && devitrify_version_after_compat(version) &&
+        devitrify_caller_draws_interface(__builtin_return_address(0))) {
+        s_in_solarium_compute_values = 0;
+        return false;
+    }
+    if (s_compatibility_mode && devitrify_version_after_compat(version) && devitrify_caller_draws_interface(__builtin_return_address(0))) return false;
     return dyld_program_sdk_at_least(version);
 }
 
@@ -213,6 +247,7 @@ static void devitrify_load_core(void) {
     keep_liquid_glass_if_listed(path);
 
     if (!appkit_is_loaded()) return;
+    s_appkit_loaded = 1;
 
     // Check if a hot-reloaded core generation is active
     char reload_path[PATH_MAX];
