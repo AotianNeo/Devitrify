@@ -76,296 +76,13 @@ static void dv_swizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOrig) 
     }
 }
 
-#pragma mark - Solarium OFF: NSGlassEffectView -> NSVisualEffectView
-
-enum { DVGlassStyleRegular = 0, DVGlassStyleClear = 1 };
-
-@interface NSVisualEffectView (DVPrivate)
-- (void)setCornerRadius:(CGFloat)radius;
-@end
-
-static NSVisualEffectMaterial dv_materialForGlassStyle(NSInteger style) {
-    return style == DVGlassStyleClear ? NSVisualEffectMaterialHUDWindow : NSVisualEffectMaterialPopover;
-}
-
-static NSVisualEffectBlendingMode dv_blendingModeForGlass(NSView *glass) {
-    NSView *root = glass.window.contentView;
-    BOOL isWindowBackground = root && (glass == root ||
-        NSEqualRects([glass convertRect:glass.bounds toView:nil], [root convertRect:root.bounds toView:nil]));
-    return isWindowBackground ? NSVisualEffectBlendingModeBehindWindow : NSVisualEffectBlendingModeWithinWindow;
-}
-
-static CGFloat dv_clampedCornerRadius(CGFloat radius, NSRect bounds) {
-    return MAX(0.0, MIN(radius, MIN(NSWidth(bounds), NSHeight(bounds)) / 2.0));
-}
-
-static NSView *dv_frostedBackdropForGlass(NSView *glass) {
-    return objc_getAssociatedObject(glass, @selector(dv_frostedBackdropForGlass:));
-}
-
-static void dv_setFrostedBackdropForGlass(NSView *glass, NSView *fx) {
-    objc_setAssociatedObject(glass, @selector(dv_frostedBackdropForGlass:), fx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-// AppKit and other system frameworks build menus and similar chrome out of
-// NSGlassEffectView too and draw them correctly by themselves. Only glass in windows
-// of an app's own classes (system apps included) or plain NSWindow / NSPanel gets a
-// backdrop.
-static BOOL dv_isAppWindow(NSWindow *window) {
-    if (!window) return NO;
-    NSString *name = NSStringFromClass([window class]);
-    // Menus already draw their classic background via NSRootMenuWindowBackgroundView
-    if ([name containsString:@"Menu"]) return NO;
-    // Status bar items in menubar are handled separately
-    if ([name containsString:@"StatusBar"]) return NO;
-    return YES;
-}
-
-static NSView *dv_hitTestPassThrough(id self, SEL _cmd, NSPoint pt) {
-    (void)self; (void)_cmd; (void)pt;
-    return nil;
-}
-
-static BOOL dv_acceptsFirstMouseNo(id self, SEL _cmd, NSEvent *event) {
-    (void)self; (void)_cmd; (void)event;
-    return NO;
-}
-
-static Class dv_ensureFrostedBackdropViewClass(void) {
-    Class cls = objc_getClass("DVFrostedBackdropView");
-    if (!cls) {
-        cls = objc_allocateClassPair([NSVisualEffectView class], "DVFrostedBackdropView", 0);
-        if (cls) {
-            class_addMethod(cls, @selector(hitTest:), (IMP)dv_hitTestPassThrough, "@@:{CGPoint=dd}");
-            class_addMethod(cls, @selector(acceptsFirstMouse:), (IMP)dv_acceptsFirstMouseNo, "c@:@");
-            objc_registerClassPair(cls);
-        } else {
-            cls = [NSVisualEffectView class];
-        }
-    } else {
-        class_replaceMethod(cls, @selector(hitTest:), (IMP)dv_hitTestPassThrough, "@@:{CGPoint=dd}");
-        class_replaceMethod(cls, @selector(acceptsFirstMouse:), (IMP)dv_acceptsFirstMouseNo, "c@:@");
-    }
-    return cls;
-}
-
-static void dv_updateFrostedBackdrop(NSView *glass) {
-    if (!dv_isAppWindow(glass.window)) return;
-    NSVisualEffectView *fx = (NSVisualEffectView *)dv_frostedBackdropForGlass(glass);
-    if (!fx) {
-        // Look for existing backdrop subview if reloaded from an earlier version
-        for (NSView *sub in glass.subviews) {
-            if ([NSStringFromClass([sub class]) isEqualToString:@"DVFrostedBackdropView"]) {
-                fx = (NSVisualEffectView *)sub;
-                break;
-            }
-        }
-        if (!fx) {
-            Class cls = dv_ensureFrostedBackdropViewClass();
-            fx = [[cls alloc] initWithFrame:glass.bounds];
-            fx.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-            fx.state = NSVisualEffectStateActive;
-        }
-        dv_setFrostedBackdropForGlass(glass, fx);
-    }
-    if (fx.superview != glass || glass.subviews.firstObject != fx) {
-        [glass addSubview:fx positioned:NSWindowBelow relativeTo:nil];
-    }
-    fx.frame = glass.bounds;
-    fx.material = dv_materialForGlassStyle([[glass valueForKey:@"style"] integerValue]);
-    fx.blendingMode = dv_blendingModeForGlass(glass);
-    [fx setCornerRadius:dv_clampedCornerRadius([[glass valueForKey:@"cornerRadius"] doubleValue], glass.bounds)];
-}
-
-// If an alert or panel does not have native Solarium glass window support,
-// we add a frosted backdrop behind the frame content as fallback.
-// When native Solarium is active (NSGlassContentFrameView / _glassEffectChildWindow),
-// native macOS Liquid Glass renders the alert backdrop cleanly.
-static void dv_updateFrameBackdrop(NSView *frameView) {
-    if (!frameView) return;
-    NSWindow *win = frameView.window;
-    if (!win) return;
-
-    BOOL isGlassFrame = [NSStringFromClass([frameView class]) containsString:@"GlassContentFrame"];
-    BOOL isAlert = [NSStringFromClass([win class]) containsString:@"Alert"];
-    if (!isGlassFrame && !isAlert) return;
-
-    // Check if native Solarium glass window or backing view is active
-    BOOL hasNativeGlass = NO;
-    if ([win respondsToSelector:@selector(_glassEffectChildWindow)]) {
-        if (((id (*)(id, SEL))objc_msgSend)(win, @selector(_glassEffectChildWindow)) != nil) {
-            hasNativeGlass = YES;
-        }
-    }
-    if (!hasNativeGlass && [frameView respondsToSelector:NSSelectorFromString(@"backingGlassEffectView")]) {
-        if (((id (*)(id, SEL))objc_msgSend)(frameView, NSSelectorFromString(@"backingGlassEffectView")) != nil) {
-            hasNativeGlass = YES;
-        }
-    }
-
-    if (hasNativeGlass || isGlassFrame) {
-        // Native Solarium is active for this alert; remove artificial fallback backdrop if present
-        NSVisualEffectView *existing = (NSVisualEffectView *)dv_frostedBackdropForGlass(frameView);
-        if (existing) {
-            [existing removeFromSuperview];
-            dv_setFrostedBackdropForGlass(frameView, nil);
-        }
-        return;
-    }
-
-    NSVisualEffectView *fx = (NSVisualEffectView *)dv_frostedBackdropForGlass(frameView);
-    if (!fx) {
-        Class cls = dv_ensureFrostedBackdropViewClass();
-        for (NSView *sub in frameView.subviews) {
-            if ([sub isKindOfClass:cls]) {
-                fx = (NSVisualEffectView *)sub;
-                break;
-            }
-        }
-        if (!fx) {
-            fx = [[cls alloc] initWithFrame:frameView.bounds];
-            fx.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-            fx.state = NSVisualEffectStateActive;
-            fx.material = NSVisualEffectMaterialPopover;
-            fx.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-
-            CGFloat rad = 16.0;
-            @try {
-                double r = [[frameView valueForKey:@"cornerRadius"] doubleValue];
-                if (r > 0) rad = r;
-                else if (win) {
-                    double wr = [[win valueForKey:@"cornerRadius"] doubleValue];
-                    if (wr > 0) rad = wr;
-                }
-            } @catch (id ex) {}
-            [fx setCornerRadius:MAX(12.0, rad)];
-            objc_setAssociatedObject(frameView, @selector(dv_updateFrameBackdrop:), fx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        dv_setFrostedBackdropForGlass(frameView, fx);
-    }
-
-    if (fx.superview != frameView || frameView.subviews.firstObject != fx) {
-        [frameView addSubview:fx positioned:NSWindowBelow relativeTo:nil];
-    }
-    fx.frame = frameView.bounds;
-}
-
-static IMP s_orig_glass_layout = NULL;
-static void swizzled_glass_layout(NSView *self, SEL _cmd) {
-    if (s_orig_glass_layout) ((void (*)(id, SEL))s_orig_glass_layout)(self, _cmd);
-    dv_updateFrostedBackdrop(self);
-}
-
-static IMP s_orig_theme_layout = NULL;
-static void swizzled_theme_layout(NSView *self, SEL _cmd) {
-    static __thread BOOL s_guard = NO;
-    if (s_guard) {
-        if (s_orig_theme_layout) ((void (*)(id, SEL))s_orig_theme_layout)(self, _cmd);
-        return;
-    }
-    s_guard = YES;
-    if (s_orig_theme_layout) ((void (*)(id, SEL))s_orig_theme_layout)(self, _cmd);
-    dv_updateFrameBackdrop(self);
-    s_guard = NO;
-}
-
-static IMP s_orig_container_layout = NULL;
-static void swizzled_container_layout(NSView *self, SEL _cmd) {
-    if (s_orig_container_layout) ((void (*)(id, SEL))s_orig_container_layout)(self, _cmd);
-    dv_updateFrostedBackdrop(self);
-}
-
-static IMP s_orig_alert_doOrderWindow = NULL;
-static void swizzled_alert_doOrderWindow(NSWindow *self, SEL _cmd, NSInteger order) {
-    if (s_orig_alert_doOrderWindow) {
-        ((void (*)(id, SEL, NSInteger))s_orig_alert_doOrderWindow)(self, _cmd, order);
-    }
-    if (self.contentView.superview) {
-        dv_updateFrameBackdrop(self.contentView.superview);
-    }
-}
-
-static IMP s_orig_glass_viewDidMoveToWindow = NULL;
-static void swizzled_glass_viewDidMoveToWindow(NSView *self, SEL _cmd) {
-    if (s_orig_glass_viewDidMoveToWindow) ((void (*)(id, SEL))s_orig_glass_viewDidMoveToWindow)(self, _cmd);
-    self.needsLayout = YES;
-}
-
-static IMP s_orig_glass_setCornerRadius = NULL;
-static void swizzled_glass_setCornerRadius(NSView *self, SEL _cmd, CGFloat radius) {
-    if (s_orig_glass_setCornerRadius) ((void (*)(id, SEL, CGFloat))s_orig_glass_setCornerRadius)(self, _cmd, radius);
-    self.needsLayout = YES;
-}
-
-static IMP s_orig_glass_setStyle = NULL;
-static void swizzled_glass_setStyle(NSView *self, SEL _cmd, NSInteger style) {
-    if (s_orig_glass_setStyle) ((void (*)(id, SEL, NSInteger))s_orig_glass_setStyle)(self, _cmd, style);
-    self.needsLayout = YES;
-}
-
-static void dv_installFrostedGlassFallback(void) {
-    Class glassCls = NSClassFromString(@"NSGlassEffectView");
-    if (glassCls) {
-        dv_swizzle(glassCls, @selector(layout), (IMP)swizzled_glass_layout, &s_orig_glass_layout);
-        dv_swizzle(glassCls, @selector(viewDidMoveToWindow), (IMP)swizzled_glass_viewDidMoveToWindow, &s_orig_glass_viewDidMoveToWindow);
-        dv_swizzle(glassCls, @selector(setCornerRadius:), (IMP)swizzled_glass_setCornerRadius, &s_orig_glass_setCornerRadius);
-        dv_swizzle(glassCls, @selector(setStyle:), (IMP)swizzled_glass_setStyle, &s_orig_glass_setStyle);
-    }
-    Class containerCls = NSClassFromString(@"NSGlassEffectContainerView");
-    if (containerCls) {
-        dv_swizzle(containerCls, @selector(layout), (IMP)swizzled_container_layout, &s_orig_container_layout);
-    }
-}
-
-// StyleMask bit 36 (0x1000000000) designates a glass-effect-backed window (e.g. _NSAlertPanel).
-// When Solarium is off, AppKit's +[NSWindow _validateStyleMask:] normally clears bit 36,
-// stripping the native _NSGlassEffectWindow backdrop and leaving the alert transparent.
-// Preserving bit 36 ensures AppKit attaches the backdrop without turning on Solarium system-wide.
-static IMP s_orig_class_validateStyleMask = NULL;
-static NSUInteger swizzled_class_validateStyleMask(id self, SEL _cmd, NSUInteger mask) {
-    NSUInteger res = s_orig_class_validateStyleMask ?
-        ((NSUInteger (*)(id, SEL, NSUInteger))s_orig_class_validateStyleMask)(self, _cmd, mask) : mask;
-    if (mask & (1ULL << 36)) res |= (1ULL << 36);
-    return res;
-}
-
-static IMP s_orig_inst_validateStyleMask = NULL;
-static NSUInteger swizzled_inst_validateStyleMask(id self, SEL _cmd, NSUInteger mask) {
-    NSUInteger res = s_orig_inst_validateStyleMask ?
-        ((NSUInteger (*)(id, SEL, NSUInteger))s_orig_inst_validateStyleMask)(self, _cmd, mask) : mask;
-    if (mask & (1ULL << 36)) res |= (1ULL << 36);
-    return res;
-}
-
-// System alert panels, sheets, and dialogs must always have frosted glass backdrops
-// across all Solarium modes (even when Solarium is enabled, NSAlertGlassSolariumEnabled is off
-// and NSGlassView renders no layer).
-static void dv_installAlertAndFrameBackdropFallback(void) {
-    Class winCls = [NSWindow class];
-    dv_swizzleClassMethod(winCls, @selector(_validateStyleMask:), (IMP)swizzled_class_validateStyleMask, &s_orig_class_validateStyleMask);
-    dv_swizzle(winCls, @selector(_validateStyleMask:), (IMP)swizzled_inst_validateStyleMask, &s_orig_inst_validateStyleMask);
-
-    Class themeFrameCls = NSClassFromString(@"NSThemeFrame");
-    if (themeFrameCls) {
-        dv_swizzle(themeFrameCls, @selector(layout), (IMP)swizzled_theme_layout, &s_orig_theme_layout);
-    }
-    Class alertPanelCls = NSClassFromString(@"_NSAlertPanel");
-    if (alertPanelCls) {
-        dv_swizzle(alertPanelCls, NSSelectorFromString(@"_doOrderWindow:"), (IMP)swizzled_alert_doOrderWindow, &s_orig_alert_doOrderWindow);
-    }
-}
-
-#pragma mark - Classic menu & alert enforcement
+#pragma mark - Classic menu enforcement
 
 static IMP s_orig_boolForKey = NULL;
 static BOOL swizzled_boolForKey(NSUserDefaults *self, SEL _cmd, NSString *key) {
     if ([key hasPrefix:@"NSGlassMenu"] ||
         [key isEqualToString:@"NSMenuUseGlassWindowStyle"]) {
         return NO;
-    }
-    if ([key isEqualToString:@"NSAlertGlassSolariumEnabled"] ||
-        [key isEqualToString:@"NSAlertUseGlassWindowStyle"]) {
-        return YES;
     }
     return s_orig_boolForKey ? ((BOOL (*)(id, SEL, NSString *))s_orig_boolForKey)(self, _cmd, key) : NO;
 }
@@ -389,8 +106,6 @@ static void dv_installClassicMenuEnforcement(void) {
         @"NSMenuUseGlassWindowStyle": @NO,
         @"NSGlassMenusUsePlainBorderView": @NO,
         @"NSGlassMenuContentAboveGlass": @NO,
-        @"NSAlertGlassSolariumEnabled": @YES,
-        @"NSAlertUseGlassWindowStyle": @YES,
     }];
 }
 
@@ -709,38 +424,44 @@ static void dv_installCompatibilityAccessibilityFix(void) {
 
 #pragma mark - Live State Refresh on Hot-Reload
 
-static void dv_refreshSubviewsRecursively(NSView *v, BOOL solariumOn) {
-    if (!v) return;
-    if (!solariumOn) {
-        if ([v isKindOfClass:NSClassFromString(@"NSGlassEffectView")]) {
-            dv_updateFrostedBackdrop(v);
-            v.needsLayout = YES;
-        }
-    }
-    CALayer *layer = v.layer;
-    if (layer && layer.filters.count > 0) {
+static void dv_refreshLayersRecursively(CALayer *layer) {
+    if (!layer) return;
+    if (layer.filters.count > 0) {
         for (id f in layer.filters) dv_neutralizeGlassFilter(f);
         layer.filters = [layer.filters copy];
     }
-    for (NSView *sub in v.subviews) {
-        dv_refreshSubviewsRecursively(sub, solariumOn);
+    for (CALayer *sub in layer.sublayers) {
+        dv_refreshLayersRecursively(sub);
     }
 }
 
-static void dv_refreshLiveWindows(BOOL solariumOn) {
+static void dv_refreshSubviewsRecursively(NSView *v) {
+    if (!v) return;
+    if (v.layer) {
+        dv_refreshLayersRecursively(v.layer);
+    }
+    for (NSView *sub in v.subviews) {
+        dv_refreshSubviewsRecursively(sub);
+    }
+}
+
+static void dv_refreshLiveWindows(void) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            dv_refreshLiveWindows(solariumOn);
+            dv_refreshLiveWindows();
         });
         return;
     }
     for (NSWindow *win in [NSApp windows]) {
-        if (!dv_isAppWindow(win)) continue;
-        NSView *tf = win.contentView.superview;
-        if (tf && ([NSStringFromClass([tf class]) containsString:@"GlassContentFrame"] || [NSStringFromClass([win class]) containsString:@"Alert"])) {
-            dv_updateFrameBackdrop(tf);
+        NSView *root = win.contentView.superview ?: win.contentView;
+        dv_refreshSubviewsRecursively(root);
+        if ([win respondsToSelector:NSSelectorFromString(@"_glassEffectChildWindow")]) {
+            NSWindow *child = ((id (*)(id, SEL))objc_msgSend)(win, NSSelectorFromString(@"_glassEffectChildWindow"));
+            if (child) {
+                NSView *childBorder = [child valueForKey:@"_borderView"];
+                dv_refreshSubviewsRecursively(childBorder);
+            }
         }
-        dv_refreshSubviewsRecursively(win.contentView, solariumOn);
     }
 }
 
@@ -787,14 +508,12 @@ static void DevitrifyInit(void) {
         } else {
             dv_installCompatibilityAccessibilityFix();
         }
-        dv_installFrostedGlassFallback();
-        dv_installAlertAndFrameBackdropFallback();
         dv_installClassicMenuEnforcement();
         dv_installKeepLiquidGlassItem();
         dv_installHotReloadListenerIfNeeded();
 
         if (NSApp) {
-            dv_refreshLiveWindows(solariumOn);
+            dv_refreshLiveWindows();
         }
     }
 }
