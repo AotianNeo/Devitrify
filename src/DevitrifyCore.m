@@ -451,48 +451,8 @@ static void dv_installSwiftUISolariumCompatibilityAllowedFix(void) {
     }
 }
 
-static void dv_installSpotlightSearchResultsCrashFix(void) {
-    // In SpotlightUIShared.SearchResults.sectionsDescription.getter : Swift.String
-    // ($s17SpotlightUIShared13SearchResultsV19sectionsDescriptionSSvg), called on the main thread
-    // by QueryController on every search response, offset +0x3a4 force-unwraps [result inlineCard]!
-    // via `cbz x0, <+2548>` (0xb4003280 -> brk #0x1), whereas a nil cardSections at +0x3c4 cleanly
-    // branches to loop continuation `<+736>` (`cbz x21, <+736>`).
-    // When SFSearchResult_SpotlightExtras / SPSettingsQueryResult has a nil inlineCard, Spotlight
-    // immediately traps with EXC_BREAKPOINT on typing. Patching `cbz x0, <+2548>` (0xb4003280) to
-    // `cbz x0, <+736>` (0xb4fff9e0) converts `result.inlineCard!` into `result.inlineCard?`.
-    void *h = dlopen("/System/Library/PrivateFrameworks/SpotlightUIShared.framework/Versions/A/SpotlightUIShared", RTLD_NOLOAD | RTLD_LAZY);
-    if (!h) return;
-    void *sym = dlsym(h, "$s17SpotlightUIShared13SearchResultsV19sectionsDescriptionSSvg");
-    if (!sym) return;
-#if __has_feature(ptrauth_calls)
-    uintptr_t fn_addr = (uintptr_t)ptrauth_strip(sym, ptrauth_key_function_pointer);
-#else
-    uintptr_t fn_addr = (uintptr_t)sym & 0x00007fffffffffffULL;
-#endif
-    fn_addr &= 0x00007fffffffffffULL;
-
-    uintptr_t patch_addr = fn_addr + 0x3a4;
-    uint32_t insn = *(uint32_t *)patch_addr;
-    uint32_t next_insn = *(uint32_t *)(patch_addr + 4);
-    if ((insn == 0xb4003280 || insn == 0xb4fff9e0) && next_insn == 0xaa0003f3) {
-        NSMutableDictionary<NSNumber *, NSData *> *patches = dv_inlinePatchMap();
-        NSNumber *key = @(patch_addr);
-        if (!patches[key]) {
-            uint32_t orig_insn = 0xb4003280;
-            patches[key] = [NSData dataWithBytes:&orig_insn length:sizeof(orig_insn)];
-        }
-        vm_address_t page = patch_addr & ~0x3fffULL;
-        if (vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
-            *(uint32_t *)patch_addr = 0xb4fff9e0; // cbz x0, <+736> (continue loop when inlineCard == nil)
-            vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-            sys_icache_invalidate((void *)patch_addr, 4);
-        }
-    }
-}
-
 static void dv_installClassicAppKit(void) {
     dv_installSwiftUISolariumCompatibilityAllowedFix();
-    dv_installSpotlightSearchResultsCrashFix();
     Class cls = NSClassFromString(@"_NSSwiftUICoreFeatureFlags");
     if (cls) {
         dv_swizzleClassMethod(cls, @selector(isSolariumEnabled), (IMP)dv_returnNo, NULL);
