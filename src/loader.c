@@ -31,8 +31,7 @@ static void detect_loaded_frameworks(void) {
         if (!name) continue;
         if (strstr(name, "/AppKit.framework/")) s_appkit_loaded = 1;
         if (strstr(name, "/SpotlightUIInternal.framework/") ||
-            strstr(name, "/UIKitCore.framework/") ||
-            strstr(name, "/UIKitMacHelper.framework/")) {
+            strstr(name, "/System/iOSSupport/")) {
             s_needs_full_swiftui_solarium = 1;
         }
     }

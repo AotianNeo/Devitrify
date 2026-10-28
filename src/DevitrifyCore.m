@@ -266,6 +266,30 @@ static BOOL dv_returnNo(id self, SEL _cmd) {
     return NO;
 }
 
+static IMP s_orig_partitionAdapter_dividerWidth = NULL;
+static CGFloat swizzled_partitionAdapter_dividerWidth(id self, SEL _cmd) {
+    SEL svSel = NSSelectorFromString(@"splitView");
+    SEL idxSel = NSSelectorFromString(@"splitViewDividerIndex");
+    SEL thickSel = NSSelectorFromString(@"_dividerThicknessForDividerAtIndex:");
+    if ([self respondsToSelector:svSel] && [self respondsToSelector:idxSel]) {
+        id sv = ((id (*)(id, SEL))objc_msgSend)(self, svSel);
+        NSInteger idx = ((NSInteger (*)(id, SEL))objc_msgSend)(self, idxSel);
+        if (sv && [sv respondsToSelector:thickSel]) {
+            return ((CGFloat (*)(id, SEL, NSInteger))objc_msgSend)(sv, thickSel, idx);
+        }
+    }
+    return s_orig_partitionAdapter_dividerWidth
+        ? ((CGFloat (*)(id, SEL))s_orig_partitionAdapter_dividerWidth)(self, _cmd)
+        : 1.0;
+}
+
+static void dv_installSplitViewTitlebarAlignmentFix(void) {
+    Class adapterCls = NSClassFromString(@"_NSSplitViewPartitionAdapter");
+    if (adapterCls) {
+        dv_swizzle(adapterCls, NSSelectorFromString(@"dividerWidth"), (IMP)swizzled_partitionAdapter_dividerWidth, &s_orig_partitionAdapter_dividerWidth);
+    }
+}
+
 static void dv_installClassicAppKit(void) {
     Class cls = NSClassFromString(@"_NSSwiftUICoreFeatureFlags");
     if (cls) {
@@ -480,6 +504,26 @@ static void dv_refreshSubviewsRecursively(NSView *v) {
     if (v.layer) {
         dv_refreshLayersRecursively(v.layer);
     }
+    if ([NSStringFromClass([v class]) isEqualToString:@"NSTitlebarContainerView"]) {
+        SEL wscSel = NSSelectorFromString(@"windowSectionController");
+        SEL ccsSel = NSSelectorFromString(@"contentControllers");
+        SEL noteSel = NSSelectorFromString(@"_noteSectionStateNeedsUpdate");
+        SEL updSel = NSSelectorFromString(@"updateSectionStateIfNeeded");
+        SEL scUpdSel = NSSelectorFromString(@"sectionControllerNeedsUpdate:");
+        if ([v respondsToSelector:wscSel]) {
+            id sc = ((id (*)(id, SEL))objc_msgSend)(v, wscSel);
+            if (sc && [sc respondsToSelector:ccsSel]) {
+                NSArray *ccs = ((NSArray *(*)(id, SEL))objc_msgSend)(sc, ccsSel);
+                for (id cc in ccs) {
+                    if ([cc respondsToSelector:noteSel]) ((void (*)(id, SEL))objc_msgSend)(cc, noteSel);
+                    if ([cc respondsToSelector:updSel]) ((void (*)(id, SEL))objc_msgSend)(cc, updSel);
+                }
+                if ([v respondsToSelector:scUpdSel]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(v, scUpdSel, sc);
+                }
+            }
+        }
+    }
     for (NSView *sub in v.subviews) {
         dv_refreshSubviewsRecursively(sub);
     }
@@ -542,6 +586,9 @@ static void DevitrifyInit(void) {
         s_liquidGlassOffSystemWide = s_keepsLiquidGlass || !solariumOn;
 
         dv_installGlassFilterNeutralization();
+        if (!s_keepsLiquidGlass) {
+            dv_installSplitViewTitlebarAlignmentFix();
+        }
 
         if (!dv_compatibilityModeViaLoader()) {
             dv_installClassicAppKit();
