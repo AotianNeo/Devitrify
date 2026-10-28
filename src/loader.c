@@ -3,24 +3,18 @@
 // nothing beyond libSystem and only loads DevitrifyCore.dylib (which links AppKit)
 // into processes that already have AppKit loaded, i.e. apps.
 
-#include <crt_externs.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
-#include <fcntl.h>
-#include <libkern/OSByteOrder.h>
-#include <mach-o/fat.h>
-#include <mach-o/loader.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
-#include <signal.h>
-#include <setjmp.h>
-#include <notify.h>
 
 #define DEVITRIFY_INSTALL_DIR "/Users/Shared/.devitrify"
 #define DEVITRIFY_DISABLED_FILE DEVITRIFY_INSTALL_DIR "/disabled"
@@ -32,40 +26,40 @@ static int s_appkit_loaded = 0;
 static volatile int s_system_disabled = 0;
 static volatile int s_process_bypassed = 0;
 
-static void sanitize_exe_name(const char *exe, char *out, size_t out_sz) {
-    const char *base = strrchr(exe, '/');
-    base = base ? base + 1 : exe;
+const char *devitrify_process_bypass_marker_path(void) {
+    static char s_marker[PATH_MAX];
+    if (s_marker[0]) return s_marker;
+
+    char executable[PATH_MAX];
+    uint32_t size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &size) != 0) return NULL;
+
+    const char *base = strrchr(executable, '/');
+    base = base ? base + 1 : executable;
+
+    char safe_name[256];
     size_t j = 0;
-    for (size_t i = 0; base[i] && j + 1 < out_sz; i++) {
+    for (size_t i = 0; base[i] && j + 1 < sizeof(safe_name); i++) {
         char c = base[i];
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
             (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
-            out[j++] = c;
+            safe_name[j++] = c;
         } else {
-            out[j++] = '_';
+            safe_name[j++] = '_';
         }
     }
-    out[j] = '\0';
-}
+    safe_name[j] = '\0';
+    if (!safe_name[0]) return NULL;
 
-static bool get_process_bypass_marker_path(char *out, size_t out_sz) {
-    char executable[PATH_MAX];
-    uint32_t size = sizeof(executable);
-    if (_NSGetExecutablePath(executable, &size) != 0) return false;
-    char safe_name[256];
-    sanitize_exe_name(executable, safe_name, sizeof(safe_name));
-    if (!safe_name[0]) return false;
-    snprintf(out, out_sz, "%s/%s.bypass", DEVITRIFY_BYPASS_DIR, safe_name);
-    return true;
+    snprintf(s_marker, sizeof(s_marker), "%s/%s.bypass", DEVITRIFY_BYPASS_DIR, safe_name);
+    return s_marker;
 }
 
 static void check_disable_and_bypass_state(void) {
     s_system_disabled = (access(DEVITRIFY_DISABLED_FILE, F_OK) == 0) ? 1 : 0;
-    char marker[PATH_MAX];
-    if (get_process_bypass_marker_path(marker, sizeof(marker))) {
-        if (access(marker, F_OK) == 0) {
-            s_process_bypassed = 1;
-        }
+    const char *marker = devitrify_process_bypass_marker_path();
+    if (marker && access(marker, F_OK) == 0) {
+        s_process_bypassed = 1;
     }
 }
 
@@ -73,16 +67,14 @@ void devitrify_set_system_disabled(int disabled) {
     s_system_disabled = disabled ? 1 : 0;
 }
 
-int devitrify_is_disabled(void) {
-    return s_system_disabled || s_process_bypassed;
-}
-
 static void detect_loaded_frameworks(void) {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
-        if (!name) continue;
-        if (strstr(name, "/AppKit.framework/")) s_appkit_loaded = 1;
+        if (name && strstr(name, "/AppKit.framework/")) {
+            s_appkit_loaded = 1;
+            break;
+        }
     }
 }
 
@@ -186,48 +178,6 @@ static bool devitrify_program_sdk_at_least(devitrify_build_version version) {
 DYLD_INTERPOSE(devitrify_program_sdk_version, dyld_get_program_sdk_version);
 DYLD_INTERPOSE(devitrify_program_sdk_at_least, dyld_program_sdk_at_least);
 
-// Kept for backward compatibility when inspecting Mach-O glass effect imports.
-__attribute__((unused)) static int executable_uses_glass_effect(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(struct mach_header_64)) { close(fd); return 0; }
-    const uint8_t *base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (base == MAP_FAILED) return 0;
-
-    int found = 0;
-    const uint8_t *image = base;
-    uint32_t magic = *(const uint32_t *)base;
-    if (magic == FAT_CIGAM) {
-        const struct fat_header *fat = (const struct fat_header *)base;
-        const struct fat_arch *arch = (const struct fat_arch *)(base + sizeof(*fat));
-        image = NULL;
-        for (uint32_t i = 0; i < OSSwapBigToHostInt32(fat->nfat_arch); i++) {
-            if (OSSwapBigToHostInt32(arch[i].cputype) == CPU_TYPE_ARM64) {
-                image = base + OSSwapBigToHostInt32(arch[i].offset);
-                break;
-            }
-        }
-    }
-    if (image && *(const uint32_t *)image == MH_MAGIC_64) {
-        const struct mach_header_64 *header = (const struct mach_header_64 *)image;
-        const struct load_command *command = (const struct load_command *)(header + 1);
-        for (uint32_t i = 0; i < header->ncmds; i++) {
-            if (command->cmd == LC_SYMTAB) {
-                const struct symtab_command *symtab = (const struct symtab_command *)command;
-                const char *strings = (const char *)image + symtab->stroff;
-                found = memmem(strings, symtab->strsize, "11glassEffect", 13) != NULL ||
-                        memmem(strings, symtab->strsize, "GlassEffectContainer", 20) != NULL;
-                break;
-            }
-            command = (const struct load_command *)((const uint8_t *)command + command->cmdsize);
-        }
-    }
-    munmap((void *)base, (size_t)st.st_size);
-    return found;
-}
-
 // Each source of a decision is "on" (compatibility mode), "stable", "off" or absent.
 enum { CHOICE_NONE, CHOICE_COMPAT, CHOICE_STABLE, CHOICE_OFF };
 
@@ -295,8 +245,8 @@ static void devitrify_load_signal_handler(int sig) {
         s_load_guard_active = 0;
         s_process_bypassed = 1;
         mkdir(DEVITRIFY_BYPASS_DIR, 0755);
-        char marker[PATH_MAX];
-        if (get_process_bypass_marker_path(marker, sizeof(marker))) {
+        const char *marker = devitrify_process_bypass_marker_path();
+        if (marker) {
             int fd = open(marker, O_CREAT | O_WRONLY | O_TRUNC, 0644);
             if (fd >= 0) {
                 char msg[64];

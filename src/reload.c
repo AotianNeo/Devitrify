@@ -199,40 +199,17 @@ int main(int argc, char **argv) {
     char new_dylib_path[1024];
     snprintf(new_dylib_path, sizeof(new_dylib_path), "%s/%s", RELOAD_DIR, new_dylib_name);
 
-    // If src/DevitrifyCore.m exists in current working directory, compile a fresh generation;
-    // otherwise copy the installed DevitrifyCore.dylib into a new generation so dlopen triggers DevitrifyInit.
-    if (access("src/DevitrifyCore.m", R_OK) == 0) {
-        printf("[Devitrify Hot-Reload] Building %s...\n", new_dylib_name);
-        char compile_cmd[2048];
-        snprintf(compile_cmd, sizeof(compile_cmd),
-            "clang -O2 -Wall -Wextra -arch arm64 -arch arm64e -fobjc-arc -dynamiclib "
-            "-framework Cocoa -framework QuartzCore "
-            "-install_name \"%s\" src/DevitrifyCore.m -o \"%s\" && "
-            "env -u DYLD_INSERT_LIBRARIES codesign -s - -f \"%s\"",
-            new_dylib_path, new_dylib_path, new_dylib_path);
-
-        if (system(compile_cmd) != 0) {
-            fprintf(stderr, "Error: compilation failed.\n");
-            return 1;
-        }
-
-        char copy_cmd[2048];
-        snprintf(copy_cmd, sizeof(copy_cmd),
-            "cp -f \"%s\" \"%s/DevitrifyCore.dylib.new\" && mv -f \"%s/DevitrifyCore.dylib.new\" \"%s/DevitrifyCore.dylib\"",
-            new_dylib_path, INSTALL_DIR, INSTALL_DIR, INSTALL_DIR);
-        system(copy_cmd);
-    } else {
-        printf("[Devitrify Hot-Reload] Cloning %s from installed DevitrifyCore.dylib...\n", new_dylib_name);
-        char clone_cmd[2048];
-        snprintf(clone_cmd, sizeof(clone_cmd),
-            "cp -f \"%s/DevitrifyCore.dylib\" \"%s\" && "
-            "install_name_tool -id \"%s\" \"%s\" 2>/dev/null && "
-            "env -u DYLD_INSERT_LIBRARIES codesign -s - -f \"%s\"",
-            INSTALL_DIR, new_dylib_path, new_dylib_path, new_dylib_path, new_dylib_path);
-        if (system(clone_cmd) != 0) {
-            fprintf(stderr, "Error: failed to clone DevitrifyCore.dylib.\n");
-            return 1;
-        }
+    // Clone the installed DevitrifyCore.dylib into a new epoch generation so dlopen triggers DevitrifyInit.
+    printf("[Devitrify Hot-Reload] Packaging %s...\n", new_dylib_name);
+    char clone_cmd[2048];
+    snprintf(clone_cmd, sizeof(clone_cmd),
+        "cp -f \"%s/DevitrifyCore.dylib\" \"%s\" && "
+        "install_name_tool -id \"%s\" \"%s\" 2>/dev/null && "
+        "env -u DYLD_INSERT_LIBRARIES codesign -s - -f \"%s\"",
+        INSTALL_DIR, new_dylib_path, new_dylib_path, new_dylib_path, new_dylib_path);
+    if (system(clone_cmd) != 0) {
+        fprintf(stderr, "Error: failed to package %s.\n", new_dylib_name);
+        return 1;
     }
 
     FILE *f = fopen(CURRENT_FILE ".tmp", "w");

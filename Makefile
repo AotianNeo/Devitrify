@@ -53,6 +53,6 @@ status:
 	$(INSTALL_DIR)/devitrify-reload --status
 
 clean:
-	rm -rf build
+	mv -f build ~/.Trash/devitrify-build.$$(date +%s) 2>/dev/null || true
 
 .PHONY: all install reload disable enable status clean
