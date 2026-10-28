@@ -43,7 +43,16 @@ install: all
 reload: install
 	$(INSTALL_DIR)/devitrify-reload
 
+disable: install
+	$(INSTALL_DIR)/devitrify-reload --disable
+
+enable: install
+	$(INSTALL_DIR)/devitrify-reload --enable
+
+status:
+	$(INSTALL_DIR)/devitrify-reload --status
+
 clean:
 	rm -rf build
 
-.PHONY: all install reload clean
+.PHONY: all install reload disable enable status clean

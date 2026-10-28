@@ -4,6 +4,19 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <notify.h>
+#import <signal.h>
+#import <setjmp.h>
+#import <libkern/OSCacheControl.h>
+#import <mach/mach.h>
+#import <sys/mman.h>
+#import <sys/stat.h>
+#if __has_feature(ptrauth_calls)
+#import <ptrauth.h>
+#endif
+
+#define DEVITRIFY_INSTALL_DIR @"/Users/Shared/.devitrify"
+#define DEVITRIFY_DISABLED_PATH @"/Users/Shared/.devitrify/disabled"
+#define DEVITRIFY_BYPASS_DIR @"/Users/Shared/.devitrify/crash-bypass"
 
 @interface CAFilter : NSObject
 + (instancetype)filterWithType:(NSString *)type;
@@ -24,16 +37,67 @@ static BOOL dv_keepsLiquidGlassViaLoader(void) {
     return keeps && keeps();
 }
 
-#pragma mark - Idempotent Swizzle Registry
+static void dv_setLoaderSystemDisabled(BOOL disabled) {
+    void (*fn)(int) = dlsym(RTLD_DEFAULT, "devitrify_set_system_disabled");
+    if (fn) fn(disabled ? 1 : 0);
+}
+
+static BOOL dv_isSystemDisabledOnDisk(void) {
+    return [NSFileManager.defaultManager fileExistsAtPath:DEVITRIFY_DISABLED_PATH];
+}
+
+static NSString *dv_processBypassMarkerPath(void) {
+    NSString *exe = NSProcessInfo.processInfo.processName ?: @"unknown";
+    NSMutableString *safe = [NSMutableString stringWithCapacity:exe.length];
+    for (NSUInteger i = 0; i < exe.length; i++) {
+        unichar c = [exe characterAtIndex:i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+            [safe appendFormat:@"%C", c];
+        } else {
+            [safe appendString:@"_"];
+        }
+    }
+    return [DEVITRIFY_BYPASS_DIR stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.bypass", safe]];
+}
+
+static BOOL dv_isProcessBypassedOnDisk(void) {
+    return [NSFileManager.defaultManager fileExistsAtPath:dv_processBypassMarkerPath()];
+}
+
+static void dv_markProcessBypassedOnDisk(int sig) {
+    [NSFileManager.defaultManager createDirectoryAtPath:DEVITRIFY_BYPASS_DIR
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+    NSString *info = [NSString stringWithFormat:@"signal=%d pid=%d\n", sig, getpid()];
+    [info writeToFile:dv_processBypassMarkerPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static BOOL s_hooksDisabled = NO;
+
+#pragma mark - Idempotent Swizzle & Inline Patch Registry
 
 // Process-wide map of original IMPs stored on [NSApplication class] so hot-reloads
-// never chain swizzles or lose the original implementation.
+// never chain swizzles or lose the original implementation, and can restore all hooks on demand.
 static NSMutableDictionary<NSString *, NSValue *> *dv_originalIMPMap(void) {
     Class host = [NSApplication class];
-    NSMutableDictionary *map = objc_getAssociatedObject(host, @selector(dv_originalIMPMap));
+    const void *key = (const void *)sel_registerName("dv_originalIMPMap");
+    NSMutableDictionary *map = objc_getAssociatedObject(host, key);
     if (!map) {
         map = [NSMutableDictionary dictionary];
-        objc_setAssociatedObject(host, @selector(dv_originalIMPMap), map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(host, key, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return map;
+}
+
+static NSMutableDictionary<NSNumber *, NSData *> *dv_inlinePatchMap(void) {
+    Class host = [NSApplication class];
+    const void *key = (const void *)sel_registerName("dv_inlinePatchMap");
+    NSMutableDictionary *map = objc_getAssociatedObject(host, key);
+    if (!map) {
+        map = [NSMutableDictionary dictionary];
+        objc_setAssociatedObject(host, key, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return map;
 }
@@ -76,12 +140,44 @@ static void dv_swizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOrig) 
     }
 }
 
+static void dv_restoreAllSwizzlesAndPatches(void) {
+    NSMutableDictionary<NSString *, NSValue *> *map = dv_originalIMPMap();
+    for (NSString *key in [map allKeys]) {
+        IMP orig = (IMP)map[key].pointerValue;
+        if (!orig) continue;
+        BOOL isClassMethod = [key hasPrefix:@"+["];
+        NSString *inner = [key substringWithRange:NSMakeRange(2, key.length - 3)];
+        NSArray<NSString *> *parts = [inner componentsSeparatedByString:@" "];
+        if (parts.count != 2) continue;
+        Class cls = NSClassFromString(parts[0]);
+        SEL sel = NSSelectorFromString(parts[1]);
+        if (!cls || !sel) continue;
+        Method m = isClassMethod ? class_getClassMethod(cls, sel) : class_getInstanceMethod(cls, sel);
+        if (m) {
+            method_setImplementation(m, orig);
+        }
+    }
+
+    NSMutableDictionary<NSNumber *, NSData *> *patches = dv_inlinePatchMap();
+    for (NSNumber *addrNum in [patches allKeys]) {
+        uintptr_t addr = addrNum.unsignedLongLongValue;
+        NSData *origBytes = patches[addrNum];
+        if (!addr || origBytes.length != 8) continue;
+        vm_address_t page = addr & ~0x3fffULL;
+        if (vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
+            memcpy((void *)addr, origBytes.bytes, 8);
+            vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+            sys_icache_invalidate((void *)addr, 8);
+        }
+    }
+}
+
 #pragma mark - Classic menu enforcement
 
 static IMP s_orig_boolForKey = NULL;
 static BOOL swizzled_boolForKey(NSUserDefaults *self, SEL _cmd, NSString *key) {
-    if ([key hasPrefix:@"NSGlassMenu"] ||
-        [key isEqualToString:@"NSMenuUseGlassWindowStyle"]) {
+    if (!s_hooksDisabled && ([key hasPrefix:@"NSGlassMenu"] ||
+        [key isEqualToString:@"NSMenuUseGlassWindowStyle"])) {
         return NO;
     }
     return s_orig_boolForKey ? ((BOOL (*)(id, SEL, NSString *))s_orig_boolForKey)(self, _cmd, key) : NO;
@@ -113,7 +209,6 @@ static void dv_installClassicMenuEnforcement(void) {
 
 static double dv_getGlassBlurRadius(void) {
     static double s_radius = 25.0;
-    // Check dynamic override file or environment on hot-reload
     NSString *conf = [NSString stringWithContentsOfFile:@"/Users/Shared/.devitrify/blur-radius"
                                                encoding:NSUTF8StringEncoding
                                                   error:nil];
@@ -154,21 +249,21 @@ static IMP s_orig_sdf_effect_setKeyColor = NULL;
 static IMP s_orig_sdf_effect_setFillColor = NULL;
 
 static void swizzled_sdf_effect_setKeyColor(id self, SEL _cmd, CGColorRef color) {
-    (void)color;
     if (s_orig_sdf_effect_setKeyColor) {
-        ((void (*)(id, SEL, CGColorRef))s_orig_sdf_effect_setKeyColor)(self, _cmd, CGColorGetConstantColor(kCGColorClear));
+        CGColorRef targetColor = s_hooksDisabled ? color : CGColorGetConstantColor(kCGColorClear);
+        ((void (*)(id, SEL, CGColorRef))s_orig_sdf_effect_setKeyColor)(self, _cmd, targetColor);
     }
 }
 
 static void swizzled_sdf_effect_setFillColor(id self, SEL _cmd, CGColorRef color) {
-    (void)color;
     if (s_orig_sdf_effect_setFillColor) {
-        ((void (*)(id, SEL, CGColorRef))s_orig_sdf_effect_setFillColor)(self, _cmd, CGColorGetConstantColor(kCGColorClear));
+        CGColorRef targetColor = s_hooksDisabled ? color : CGColorGetConstantColor(kCGColorClear);
+        ((void (*)(id, SEL, CGColorRef))s_orig_sdf_effect_setFillColor)(self, _cmd, targetColor);
     }
 }
 
 static void swizzled_sdf_setEffect(CALayer *self, SEL _cmd, id effect) {
-    if (effect && [NSStringFromClass([effect class]) isEqualToString:@"CASDFKeyFillHighlightEffect"]) {
+    if (!s_hooksDisabled && effect && [NSStringFromClass([effect class]) isEqualToString:@"CASDFKeyFillHighlightEffect"]) {
         @try {
             [effect setValue:(__bridge id)CGColorGetConstantColor(kCGColorClear) forKey:@"keyColor"];
             [effect setValue:(__bridge id)CGColorGetConstantColor(kCGColorClear) forKey:@"fillColor"];
@@ -180,6 +275,7 @@ static void swizzled_sdf_setEffect(CALayer *self, SEL _cmd, id effect) {
 }
 
 static void dv_neutralizeGlassFilter(id filter) {
+    if (s_hooksDisabled) return;
     @try {
         NSString *type = [filter valueForKey:@"type"];
         if (!dv_isGlassFilterType(type)) return;
@@ -197,19 +293,21 @@ static void dv_neutralizeGlassFilter(id filter) {
 static IMP s_orig_filterWithType = NULL;
 static id swizzled_filterWithType(id self, SEL _cmd, NSString *type) {
     id f = s_orig_filterWithType ? ((id (*)(id, SEL, NSString *))s_orig_filterWithType)(self, _cmd, type) : nil;
-    if (f && dv_isGlassFilterType(type)) dv_neutralizeGlassFilter(f);
+    if (!s_hooksDisabled && f && dv_isGlassFilterType(type)) dv_neutralizeGlassFilter(f);
     return f;
 }
 
 static IMP s_orig_cafilter_setValueForKey = NULL;
 static void swizzled_cafilter_setValueForKey(id self, SEL _cmd, id value, NSString *key) {
-    NSString *type = nil;
-    @try { type = [self valueForKey:@"type"]; } @catch (id ex) {}
-    if (dv_isGlassFilterType(type)) {
-        if (dv_isRefractionKey(key)) {
-            value = @0;
-        } else if ([type isEqualToString:@"glassBackground"] && [key isEqualToString:@"inputBlurRadius"]) {
-            value = @(dv_getGlassBlurRadius());
+    if (!s_hooksDisabled) {
+        NSString *type = nil;
+        @try { type = [self valueForKey:@"type"]; } @catch (id ex) {}
+        if (dv_isGlassFilterType(type)) {
+            if (dv_isRefractionKey(key)) {
+                value = @0;
+            } else if ([type isEqualToString:@"glassBackground"] && [key isEqualToString:@"inputBlurRadius"]) {
+                value = @(dv_getGlassBlurRadius());
+            }
         }
     }
     if (s_orig_cafilter_setValueForKey) {
@@ -219,13 +317,15 @@ static void swizzled_cafilter_setValueForKey(id self, SEL _cmd, id value, NSStri
 
 static IMP s_orig_setFilters = NULL;
 static void swizzled_setFilters(id self, SEL _cmd, NSArray *filters) {
-    for (id f in filters) dv_neutralizeGlassFilter(f);
+    if (!s_hooksDisabled) {
+        for (id f in filters) dv_neutralizeGlassFilter(f);
+    }
     if (s_orig_setFilters) ((void (*)(id, SEL, NSArray *))s_orig_setFilters)(self, _cmd, filters);
 }
 
 static IMP s_orig_setValueForKeyPath = NULL;
 static void swizzled_setValueForKeyPath(id self, SEL _cmd, id value, NSString *keyPath) {
-    if ([keyPath hasPrefix:@"filters.glass"]) {
+    if (!s_hooksDisabled && [keyPath hasPrefix:@"filters.glass"]) {
         NSString *key = [[keyPath componentsSeparatedByString:@"."] lastObject];
         if (dv_isRefractionKey(key)) {
             value = @0;
@@ -268,14 +368,16 @@ static BOOL dv_returnNo(id self, SEL _cmd) {
 
 static IMP s_orig_partitionAdapter_dividerWidth = NULL;
 static CGFloat swizzled_partitionAdapter_dividerWidth(id self, SEL _cmd) {
-    SEL svSel = NSSelectorFromString(@"splitView");
-    SEL idxSel = NSSelectorFromString(@"splitViewDividerIndex");
-    SEL thickSel = NSSelectorFromString(@"_dividerThicknessForDividerAtIndex:");
-    if ([self respondsToSelector:svSel] && [self respondsToSelector:idxSel]) {
-        id sv = ((id (*)(id, SEL))objc_msgSend)(self, svSel);
-        NSInteger idx = ((NSInteger (*)(id, SEL))objc_msgSend)(self, idxSel);
-        if (sv && [sv respondsToSelector:thickSel]) {
-            return ((CGFloat (*)(id, SEL, NSInteger))objc_msgSend)(sv, thickSel, idx);
+    if (!s_hooksDisabled) {
+        SEL svSel = NSSelectorFromString(@"splitView");
+        SEL idxSel = NSSelectorFromString(@"splitViewDividerIndex");
+        SEL thickSel = NSSelectorFromString(@"_dividerThicknessForDividerAtIndex:");
+        if ([self respondsToSelector:svSel] && [self respondsToSelector:idxSel]) {
+            id sv = ((id (*)(id, SEL))objc_msgSend)(self, svSel);
+            NSInteger idx = ((NSInteger (*)(id, SEL))objc_msgSend)(self, idxSel);
+            if (sv && [sv respondsToSelector:thickSel]) {
+                return ((CGFloat (*)(id, SEL, NSInteger))objc_msgSend)(sv, thickSel, idx);
+            }
         }
     }
     return s_orig_partitionAdapter_dividerWidth
@@ -295,14 +397,62 @@ static Class swizzled_splitvc_implClass(id self, SEL _cmd, id splitVC) {
     Class cls = s_orig_splitvc_implClass
         ? ((Class (*)(id, SEL, id))s_orig_splitvc_implClass)(self, _cmd, splitVC)
         : nil;
-    if (cls && [NSStringFromClass(cls) isEqualToString:@"UISplitViewControllerPanelImpl"]) {
+    if (!s_hooksDisabled && cls && [NSStringFromClass(cls) isEqualToString:@"UISplitViewControllerPanelImpl"]) {
         Class adaptiveCls = NSClassFromString(@"_UISplitViewControllerAdaptiveImpl");
         if (adaptiveCls) return adaptiveCls;
     }
     return cls;
 }
 
+static void dv_installSwiftUISolariumCompatibilityAllowedFix(void) {
+    // When SwiftUI runs in level .compatibility (1) with Solarium disabled system-wide,
+    // SwiftUI.Solarium.evaluate(inputs:) queries SwiftUI.Solarium.AllowedInCompatibilityKey.
+    // If that key is not explicitly set, it defaults to false, causing SpotlightUIInternal's
+    // StaticIf<Solarium, GlassEffect, EmptyView> to collapse into EmptyView (transparent window).
+    // We patch AllowedInCompatibilityKey getter in SwiftUICore to return true (1), so
+    // .compatibility apps and Spotlight render their full view tree while keeping classic metrics.
+    void *h = dlopen("/System/Library/Frameworks/SwiftUICore.framework/Versions/A/SwiftUICore", RTLD_NOLOAD | RTLD_LAZY);
+    if (!h) return;
+    void *eval_sym = dlsym(h, "$s7SwiftUI8SolariumV8evaluate6inputsSbAA12_GraphInputsV_tFZ");
+    if (!eval_sym) return;
+#if __has_feature(ptrauth_calls)
+    uintptr_t eval_addr = (uintptr_t)ptrauth_strip(eval_sym, ptrauth_key_function_pointer);
+#else
+    uintptr_t eval_addr = (uintptr_t)eval_sym & 0x00007fffffffffffULL;
+#endif
+    eval_addr &= 0x00007fffffffffffULL;
+
+    uint32_t b_insn = *(uint32_t *)eval_addr;
+    if ((b_insn & 0xfc000000) != 0x14000000) return; // must be unconditional branch `b`
+    int32_t imm26 = (int32_t)(b_insn & 0x03ffffff);
+    if (imm26 & 0x02000000) imm26 |= 0xfc000000;
+    uintptr_t target = eval_addr + ((intptr_t)imm26 * 4);
+
+    // In specialized evaluate, instruction at target + 0x0c8 is `b <AllowedInCompatibilityKey getter>`
+    uint32_t b_to_getter = *(uint32_t *)(target + 0x0c8);
+    if ((b_to_getter & 0xfc000000) != 0x14000000) return;
+    int32_t imm_getter = (int32_t)(b_to_getter & 0x03ffffff);
+    if (imm_getter & 0x02000000) imm_getter |= 0xfc000000;
+    uintptr_t getter_addr = (target + 0x0c8) + ((intptr_t)imm_getter * 4);
+
+    NSMutableDictionary<NSNumber *, NSData *> *patches = dv_inlinePatchMap();
+    NSNumber *key = @(getter_addr);
+    if (!patches[key]) {
+        patches[key] = [NSData dataWithBytes:(const void *)getter_addr length:8];
+    }
+
+    vm_address_t page = getter_addr & ~0x3fffULL;
+    kern_return_t kr = vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr == KERN_SUCCESS) {
+        *(uint32_t *)getter_addr = 0x52800020;         // mov w0, #1
+        *(uint32_t *)(getter_addr + 4) = 0xd65f03c0;     // ret
+        vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        sys_icache_invalidate((void *)getter_addr, 8);
+    }
+}
+
 static void dv_installClassicAppKit(void) {
+    dv_installSwiftUISolariumCompatibilityAllowedFix();
     Class cls = NSClassFromString(@"_NSSwiftUICoreFeatureFlags");
     if (cls) {
         dv_swizzleClassMethod(cls, @selector(isSolariumEnabled), (IMP)dv_returnNo, NULL);
@@ -488,7 +638,9 @@ static id swizzled_cell_attributeValue(id self, SEL _cmd, NSString *attribute) {
 static IMP s_orig_cell_attributeNames = NULL;
 static NSArray *swizzled_cell_attributeNames(id self, SEL _cmd) {
     NSArray *names = s_orig_cell_attributeNames ? ((NSArray *(*)(id, SEL))s_orig_cell_attributeNames)(self, _cmd) : nil;
-    if (names && ![names containsObject:NSAccessibilitySubroleAttribute]) names = [names arrayByAddingObject:NSAccessibilitySubroleAttribute];
+    if (!s_hooksDisabled && names && ![names containsObject:NSAccessibilitySubroleAttribute]) {
+        names = [names arrayByAddingObject:NSAccessibilitySubroleAttribute];
+    }
     return names;
 }
 
@@ -507,11 +659,15 @@ static void dv_refreshLayersRecursively(CALayer *layer) {
     if ([NSStringFromClass([layer class]) isEqualToString:@"CASDFLayer"]) {
         @try {
             id eff = [layer valueForKey:@"effect"];
-            if (eff) swizzled_sdf_setEffect(layer, NSSelectorFromString(@"setEffect:"), eff);
+            if (eff && !s_hooksDisabled) {
+                swizzled_sdf_setEffect(layer, NSSelectorFromString(@"setEffect:"), eff);
+            }
         } @catch (id ex) {}
     }
     if (layer.filters.count > 0) {
-        for (id f in layer.filters) dv_neutralizeGlassFilter(f);
+        if (!s_hooksDisabled) {
+            for (id f in layer.filters) dv_neutralizeGlassFilter(f);
+        }
         layer.filters = [layer.filters copy];
     }
     for (CALayer *sub in layer.sublayers) {
@@ -544,6 +700,8 @@ static void dv_refreshSubviewsRecursively(NSView *v) {
             }
         }
     }
+    [v setNeedsLayout:YES];
+    [v setNeedsDisplay:YES];
     for (NSView *sub in v.subviews) {
         dv_refreshSubviewsRecursively(sub);
     }
@@ -569,7 +727,60 @@ static void dv_refreshLiveWindows(void) {
     }
 }
 
-#pragma mark - Hot-Reload Listener
+#pragma mark - Fault-Tolerant Execution Guard & Hot-Reload Listener
+
+static sigjmp_buf s_core_jmp_buf;
+static volatile sig_atomic_t s_core_guard_active = 0;
+
+static void dv_coreSignalHandler(int sig) {
+    if (s_core_guard_active) {
+        s_core_guard_active = 0;
+        siglongjmp(s_core_jmp_buf, sig);
+    }
+}
+
+static BOOL dv_runFaultTolerant(void (^block)(void)) {
+    struct sigaction sa_new, sa_old_segv, sa_old_bus, sa_old_ill, sa_old_trap, sa_old_abrt;
+    memset(&sa_new, 0, sizeof(sa_new));
+    sa_new.sa_handler = dv_coreSignalHandler;
+    sigemptyset(&sa_new.sa_mask);
+    sa_new.sa_flags = 0;
+
+    sigaction(SIGSEGV, &sa_new, &sa_old_segv);
+    sigaction(SIGBUS,  &sa_new, &sa_old_bus);
+    sigaction(SIGILL,  &sa_new, &sa_old_ill);
+    sigaction(SIGTRAP, &sa_new, &sa_old_trap);
+    sigaction(SIGABRT, &sa_new, &sa_old_abrt);
+
+    BOOL ok = YES;
+    s_core_guard_active = 1;
+    int caught_sig = sigsetjmp(s_core_jmp_buf, 1);
+    if (caught_sig == 0) {
+        @try {
+            block();
+        } @catch (id ex) {
+            ok = NO;
+            dv_markProcessBypassedOnDisk(0);
+        }
+    } else {
+        ok = NO;
+        dv_markProcessBypassedOnDisk(caught_sig);
+    }
+    s_core_guard_active = 0;
+
+    sigaction(SIGSEGV, &sa_old_segv, NULL);
+    sigaction(SIGBUS,  &sa_old_bus,  NULL);
+    sigaction(SIGILL,  &sa_old_ill,  NULL);
+    sigaction(SIGTRAP, &sa_old_trap, NULL);
+    sigaction(SIGABRT, &sa_old_abrt, NULL);
+
+    if (!ok) {
+        s_hooksDisabled = YES;
+        dv_setLoaderSystemDisabled(YES);
+        dv_restoreAllSwizzlesAndPatches();
+    }
+    return ok;
+}
 
 static void dv_performHotReload(void) {
     NSString *currentPath = [NSString stringWithContentsOfFile:@"/Users/Shared/.devitrify/reload/current"
@@ -581,13 +792,16 @@ static void dv_performHotReload(void) {
     if (!currentPath || currentPath.length == 0) {
         currentPath = @"/Users/Shared/.devitrify/DevitrifyCore.dylib";
     }
-    dlopen(currentPath.UTF8String, RTLD_NOW | RTLD_LOCAL);
+    dv_runFaultTolerant(^{
+        dlopen(currentPath.UTF8String, RTLD_NOW | RTLD_LOCAL);
+    });
 }
 
 static void dv_installHotReloadListenerIfNeeded(void) {
     Class host = [NSApplication class];
-    if (objc_getAssociatedObject(host, @selector(dv_installHotReloadListenerIfNeeded))) return;
-    objc_setAssociatedObject(host, @selector(dv_installHotReloadListenerIfNeeded), @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    const void *key = (const void *)sel_registerName("dv_installHotReloadListenerIfNeeded");
+    if (objc_getAssociatedObject(host, key)) return;
+    objc_setAssociatedObject(host, key, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     int token = 0;
     notify_register_dispatch("com.aotianneo.devitrify.reload", &token, dispatch_get_main_queue(), ^(int t) {
@@ -601,26 +815,43 @@ static void dv_installHotReloadListenerIfNeeded(void) {
 __attribute__((constructor))
 static void DevitrifyInit(void) {
     @autoreleasepool {
-        s_keepsLiquidGlass = dv_keepsLiquidGlassViaLoader();
-        BOOL solariumOn = _os_feature_enabled_impl("SwiftUI", "Solarium");
-        s_liquidGlassOffSystemWide = s_keepsLiquidGlass || !solariumOn;
-
-        dv_installGlassFilterNeutralization();
-        if (!s_keepsLiquidGlass) {
-            dv_installSplitViewTitlebarAlignmentFix();
-        }
-
-        if (!dv_compatibilityModeViaLoader()) {
-            dv_installClassicAppKit();
-        } else {
-            dv_installCompatibilityAccessibilityFix();
-        }
-        dv_installClassicMenuEnforcement();
-        dv_installKeepLiquidGlassItem();
         dv_installHotReloadListenerIfNeeded();
 
-        if (NSApp) {
-            dv_refreshLiveWindows();
+        BOOL sysDisabled = dv_isSystemDisabledOnDisk();
+        BOOL procBypassed = dv_isProcessBypassedOnDisk();
+        dv_setLoaderSystemDisabled(sysDisabled || procBypassed);
+
+        if (sysDisabled || procBypassed) {
+            s_hooksDisabled = YES;
+            dv_restoreAllSwizzlesAndPatches();
+            if (NSApp) {
+                dv_refreshLiveWindows();
+            }
+            return;
         }
+
+        s_hooksDisabled = NO;
+        dv_runFaultTolerant(^{
+            s_keepsLiquidGlass = dv_keepsLiquidGlassViaLoader();
+            BOOL solariumOn = _os_feature_enabled_impl("SwiftUI", "Solarium");
+            s_liquidGlassOffSystemWide = s_keepsLiquidGlass || !solariumOn;
+
+            dv_installGlassFilterNeutralization();
+            if (!s_keepsLiquidGlass) {
+                dv_installSplitViewTitlebarAlignmentFix();
+            }
+
+            if (!dv_compatibilityModeViaLoader()) {
+                dv_installClassicAppKit();
+            } else {
+                dv_installCompatibilityAccessibilityFix();
+            }
+            dv_installClassicMenuEnforcement();
+            dv_installKeepLiquidGlassItem();
+
+            if (NSApp) {
+                dv_refreshLiveWindows();
+            }
+        });
     }
 }

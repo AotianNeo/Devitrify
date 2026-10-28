@@ -18,11 +18,64 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <notify.h>
+
+#define DEVITRIFY_INSTALL_DIR "/Users/Shared/.devitrify"
+#define DEVITRIFY_DISABLED_FILE DEVITRIFY_INSTALL_DIR "/disabled"
+#define DEVITRIFY_BYPASS_DIR DEVITRIFY_INSTALL_DIR "/crash-bypass"
 
 static int s_keep_liquid_glass = 0;
 static int s_compatibility_mode = 0;
 static int s_appkit_loaded = 0;
-static int s_needs_full_swiftui_solarium = 0;
+static volatile int s_system_disabled = 0;
+static volatile int s_process_bypassed = 0;
+
+static void sanitize_exe_name(const char *exe, char *out, size_t out_sz) {
+    const char *base = strrchr(exe, '/');
+    base = base ? base + 1 : exe;
+    size_t j = 0;
+    for (size_t i = 0; base[i] && j + 1 < out_sz; i++) {
+        char c = base[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+            out[j++] = c;
+        } else {
+            out[j++] = '_';
+        }
+    }
+    out[j] = '\0';
+}
+
+static bool get_process_bypass_marker_path(char *out, size_t out_sz) {
+    char executable[PATH_MAX];
+    uint32_t size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &size) != 0) return false;
+    char safe_name[256];
+    sanitize_exe_name(executable, safe_name, sizeof(safe_name));
+    if (!safe_name[0]) return false;
+    snprintf(out, out_sz, "%s/%s.bypass", DEVITRIFY_BYPASS_DIR, safe_name);
+    return true;
+}
+
+static void check_disable_and_bypass_state(void) {
+    s_system_disabled = (access(DEVITRIFY_DISABLED_FILE, F_OK) == 0) ? 1 : 0;
+    char marker[PATH_MAX];
+    if (get_process_bypass_marker_path(marker, sizeof(marker))) {
+        if (access(marker, F_OK) == 0) {
+            s_process_bypassed = 1;
+        }
+    }
+}
+
+void devitrify_set_system_disabled(int disabled) {
+    s_system_disabled = disabled ? 1 : 0;
+}
+
+int devitrify_is_disabled(void) {
+    return s_system_disabled || s_process_bypassed;
+}
 
 static void detect_loaded_frameworks(void) {
     uint32_t count = _dyld_image_count();
@@ -30,9 +83,6 @@ static void detect_loaded_frameworks(void) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
         if (strstr(name, "/AppKit.framework/")) s_appkit_loaded = 1;
-        if (strstr(name, "/SpotlightUIInternal.framework/")) {
-            s_needs_full_swiftui_solarium = 1;
-        }
     }
 }
 
@@ -64,13 +114,16 @@ static bool devitrify_caller_is_swift_feature_flags(const void *address) {
 }
 
 static bool devitrify_feature_enabled(const char *domain, const char *feature) {
+    if (s_system_disabled || s_process_bypassed) {
+        return _os_feature_enabled_impl(domain, feature);
+    }
     if (domain && feature) {
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "flexiGlassMacOS")) return true;
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) {
             const void *ret = __builtin_return_address(0);
             if (s_keep_liquid_glass) return true;
             if (s_appkit_loaded && devitrify_caller_is_swift_feature_flags(ret)) {
-                if (!s_needs_full_swiftui_solarium) s_in_solarium_compute_values = 1;
+                s_in_solarium_compute_values = 1;
                 return true;
             }
         }
@@ -112,11 +165,15 @@ static bool devitrify_caller_draws_interface(const void *address) {
 
 static uint32_t devitrify_program_sdk_version(void) {
     uint32_t real = dyld_get_program_sdk_version();
+    if (s_system_disabled || s_process_bypassed) return real;
     if (s_compatibility_mode && real > DEVITRIFY_COMPATIBILITY_SDK && devitrify_caller_draws_interface(__builtin_return_address(0))) return DEVITRIFY_COMPATIBILITY_SDK;
     return real;
 }
 
 static bool devitrify_program_sdk_at_least(devitrify_build_version version) {
+    if (s_system_disabled || s_process_bypassed) {
+        return dyld_program_sdk_at_least(version);
+    }
     if (s_in_solarium_compute_values && devitrify_version_after_compat(version) &&
         devitrify_caller_draws_interface(__builtin_return_address(0))) {
         s_in_solarium_compute_values = 0;
@@ -181,9 +238,6 @@ static int choice_from_text(const char *text) {
 }
 
 static void keep_liquid_glass_if_listed(const char *dir) {
-    // Processes that already have Solarium enabled (system-wide or via FEATUREFLAGS_ENABLED,
-    // such as ControlCenter and NotificationCenter) must not be forced into macOS 15 SDK
-    // compatibility mode.
     if (_os_feature_enabled_impl("SwiftUI", "Solarium")) return;
 
     char executable[PATH_MAX];
@@ -194,8 +248,6 @@ static void keep_liquid_glass_if_listed(const char *dir) {
     if (strstr(executable, ".app/Contents/MacOS/")) {
         const char *home = getenv("HOME");
         if (home && strstr(home, "/Library/Containers/")) {
-            // Sandboxed apps can't read liquid-glass-apps. Their HOME is their container, where
-            // Help > Keep Liquid Glass leaves a marker file.
             char marker[PATH_MAX];
             snprintf(marker, sizeof(marker), "%s/Library/Application Support/devitrify-keep-liquid-glass", home);
             FILE *file = fopen(marker, "r");
@@ -233,8 +285,61 @@ static void keep_liquid_glass_if_listed(const char *dir) {
     if (choice == CHOICE_COMPAT) s_compatibility_mode = 1;
 }
 
+// Crash-guard for dlopen(DevitrifyCore): if loading or initializing hooks triggers SIGSEGV/SIGBUS/SIGILL/SIGABRT,
+// record a per-process bypass marker and longjmp back so the host app continues running cleanly without hooks.
+static sigjmp_buf s_load_jmp_buf;
+static volatile sig_atomic_t s_load_guard_active = 0;
+
+static void devitrify_load_signal_handler(int sig) {
+    if (s_load_guard_active) {
+        s_load_guard_active = 0;
+        s_process_bypassed = 1;
+        mkdir(DEVITRIFY_BYPASS_DIR, 0755);
+        char marker[PATH_MAX];
+        if (get_process_bypass_marker_path(marker, sizeof(marker))) {
+            int fd = open(marker, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (fd >= 0) {
+                char msg[64];
+                int len = snprintf(msg, sizeof(msg), "signal=%d\n", sig);
+                if (len > 0) (void)write(fd, msg, (size_t)len);
+                close(fd);
+            }
+        }
+        siglongjmp(s_load_jmp_buf, sig);
+    }
+}
+
+static void safe_dlopen_core(const char *dylib_path) {
+    struct sigaction sa_new, sa_old_segv, sa_old_bus, sa_old_ill, sa_old_trap, sa_old_abrt;
+    memset(&sa_new, 0, sizeof(sa_new));
+    sa_new.sa_handler = devitrify_load_signal_handler;
+    sigemptyset(&sa_new.sa_mask);
+    sa_new.sa_flags = 0;
+
+    sigaction(SIGSEGV, &sa_new, &sa_old_segv);
+    sigaction(SIGBUS,  &sa_new, &sa_old_bus);
+    sigaction(SIGILL,  &sa_new, &sa_old_ill);
+    sigaction(SIGTRAP, &sa_new, &sa_old_trap);
+    sigaction(SIGABRT, &sa_new, &sa_old_abrt);
+
+    s_load_guard_active = 1;
+    if (sigsetjmp(s_load_jmp_buf, 1) == 0) {
+        dlopen(dylib_path, RTLD_NOW | RTLD_LOCAL);
+    }
+    s_load_guard_active = 0;
+
+    sigaction(SIGSEGV, &sa_old_segv, NULL);
+    sigaction(SIGBUS,  &sa_old_bus,  NULL);
+    sigaction(SIGILL,  &sa_old_ill,  NULL);
+    sigaction(SIGTRAP, &sa_old_trap, NULL);
+    sigaction(SIGABRT, &sa_old_abrt, NULL);
+}
+
 __attribute__((constructor))
 static void devitrify_load_core(void) {
+    check_disable_and_bypass_state();
+    if (s_process_bypassed) return;
+
     Dl_info info;
     char path[PATH_MAX];
     if (!dladdr((const void *)devitrify_load_core, &info) || !realpath(info.dli_fname, path)) return;
@@ -247,7 +352,8 @@ static void devitrify_load_core(void) {
 
     if (!s_appkit_loaded) return;
 
-    // Check if a hot-reloaded core generation is active
+    // Even if s_system_disabled is currently 1, we still load DevitrifyCore so the process
+    // registers the hot-reload listener and can be re-enabled live via `devitrify-reload --enable`.
     char reload_path[PATH_MAX];
     snprintf(reload_path, sizeof(reload_path), "%s/reload/current", path);
     FILE *f = fopen(reload_path, "r");
@@ -257,7 +363,7 @@ static void devitrify_load_core(void) {
             line[strcspn(line, "\r\n")] = '\0';
             if (line[0] && access(line, R_OK) == 0) {
                 fclose(f);
-                dlopen(line, RTLD_NOW | RTLD_LOCAL);
+                safe_dlopen_core(line);
                 return;
             }
         }
@@ -265,5 +371,5 @@ static void devitrify_load_core(void) {
     }
 
     strlcat(path, "/DevitrifyCore.dylib", sizeof(path));
-    dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    safe_dlopen_core(path);
 }
