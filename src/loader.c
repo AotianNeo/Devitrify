@@ -30,8 +30,7 @@ static void detect_loaded_frameworks(void) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
         if (strstr(name, "/AppKit.framework/")) s_appkit_loaded = 1;
-        if (strstr(name, "/SpotlightUIInternal.framework/") ||
-            strstr(name, "/System/iOSSupport/")) {
+        if (strstr(name, "/SpotlightUIInternal.framework/")) {
             s_needs_full_swiftui_solarium = 1;
         }
     }
@@ -64,19 +63,12 @@ static bool devitrify_caller_is_swift_feature_flags(const void *address) {
            strstr(info.dli_fname, "FeatureFlags") != NULL;
 }
 
-static bool devitrify_caller_is_uikit_core(const void *address) {
-    Dl_info info;
-    if (!dladdr(address, &info) || !info.dli_fname) return false;
-    return strstr(info.dli_fname, "/UIKitCore.framework/") != NULL;
-}
-
 static bool devitrify_feature_enabled(const char *domain, const char *feature) {
     if (domain && feature) {
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "flexiGlassMacOS")) return true;
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) {
             const void *ret = __builtin_return_address(0);
             if (s_keep_liquid_glass) return true;
-            if (s_appkit_loaded && devitrify_caller_is_uikit_core(ret)) return true;
             if (s_appkit_loaded && devitrify_caller_is_swift_feature_flags(ret)) {
                 if (!s_needs_full_swiftui_solarium) s_in_solarium_compute_values = 1;
                 return true;

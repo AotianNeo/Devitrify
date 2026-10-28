@@ -290,11 +290,31 @@ static void dv_installSplitViewTitlebarAlignmentFix(void) {
     }
 }
 
+static IMP s_orig_splitvc_implClass = NULL;
+static Class swizzled_splitvc_implClass(id self, SEL _cmd, id splitVC) {
+    Class cls = s_orig_splitvc_implClass
+        ? ((Class (*)(id, SEL, id))s_orig_splitvc_implClass)(self, _cmd, splitVC)
+        : nil;
+    if (cls && [NSStringFromClass(cls) isEqualToString:@"UISplitViewControllerPanelImpl"]) {
+        Class adaptiveCls = NSClassFromString(@"_UISplitViewControllerAdaptiveImpl");
+        if (adaptiveCls) return adaptiveCls;
+    }
+    return cls;
+}
+
 static void dv_installClassicAppKit(void) {
     Class cls = NSClassFromString(@"_NSSwiftUICoreFeatureFlags");
     if (cls) {
         dv_swizzleClassMethod(cls, @selector(isSolariumEnabled), (IMP)dv_returnNo, NULL);
         dv_swizzleClassMethod(cls, NSSelectorFromString(@"isSolariumEnabledIgnoringCompatibility"), (IMP)dv_returnNo, NULL);
+    }
+    Class uikitFeaturesCls = NSClassFromString(@"_UIKitFeatures");
+    if (uikitFeaturesCls) {
+        dv_swizzleClassMethod(uikitFeaturesCls, NSSelectorFromString(@"uncachedSolariumEnabledForCurrentDeviceIdiom"), (IMP)dv_returnNo, NULL);
+    }
+    Class splitImplProviderCls = NSClassFromString(@"UISplitViewControllerDefaultImplProvider");
+    if (splitImplProviderCls) {
+        dv_swizzle(splitImplProviderCls, NSSelectorFromString(@"implClassForSplitViewController:"), (IMP)swizzled_splitvc_implClass, &s_orig_splitvc_implClass);
     }
 }
 
