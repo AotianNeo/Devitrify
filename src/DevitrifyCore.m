@@ -364,12 +364,12 @@ static Class swizzled_splitvc_implClass(id self, SEL _cmd, id splitVC) {
 }
 
 static void dv_installSwiftUISolariumCompatibilityAllowedFix(void) {
-    // When SwiftUI runs in level .compatibility (1) with Solarium disabled system-wide,
-    // SwiftUI.Solarium.evaluate(inputs:) queries SwiftUI.Solarium.AllowedInCompatibilityKey.
-    // If that key is not explicitly set, it defaults to false, causing SpotlightUIInternal's
-    // StaticIf<Solarium, GlassEffect, EmptyView> to collapse into EmptyView (transparent window).
-    // We patch AllowedInCompatibilityKey getter in SwiftUICore to return true (1), so
-    // .compatibility apps and Spotlight render their full view tree while keeping classic metrics.
+    // Only Spotlight (SpotlightUIInternal.framework) uses StaticIf<Solarium, GlassEffect, EmptyView>
+    // with no classic fallback. In all other apps (such as Apple Music), AllowedInCompatibilityKey
+    // must remain false in .compatibility mode so SwiftUI controls and toolbars stay classic.
+    if (!dlopen("/System/Library/PrivateFrameworks/SpotlightUIInternal.framework/Versions/A/SpotlightUIInternal", RTLD_NOLOAD | RTLD_LAZY)) {
+        return;
+    }
     void *h = dlopen("/System/Library/Frameworks/SwiftUICore.framework/Versions/A/SwiftUICore", RTLD_NOLOAD | RTLD_LAZY);
     if (!h) return;
     void *eval_sym = dlsym(h, "$s7SwiftUI8SolariumV8evaluate6inputsSbAA12_GraphInputsV_tFZ");
