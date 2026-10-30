@@ -50,6 +50,7 @@ fi
 /bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.notificationcenterui.agent"
 /bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.campo" 2>/dev/null || true
 /bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.Spotlight" 2>/dev/null || true
+/bin/launchctl kill SIGTERM "gui/$(/usr/bin/id -u)/com.apple.screencaptureui.agent" 2>/dev/null || true
 if /usr/bin/pgrep -x Rectangle >/dev/null 2>&1; then
     /usr/bin/killall Rectangle >/dev/null 2>&1 && /usr/bin/open -g -a Rectangle
 fi

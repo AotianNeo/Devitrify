@@ -102,6 +102,18 @@ install-launchpad: install
 		env -u DYLD_INSERT_LIBRARIES codesign -d --entitlements "$$DOCK_ENTS" --xml assets/Dock.app 2>/dev/null; \
 		env -u DYLD_INSERT_LIBRARIES codesign --force --sign - --entitlements "$$DOCK_ENTS" "$(INSTALL_DIR)/Dock.app/Contents/MacOS/Dock"; \
 		mv -f "$$DOCK_ENTS" ~/.Trash/ 2>/dev/null || true; \
+		for xpc in "$(INSTALL_DIR)"/Dock.app/Contents/XPCServices/*.xpc; do \
+			if [ -d "$$xpc" ]; then \
+				XPC_ENTS=build/xpc-ents.plist; \
+				env -u DYLD_INSERT_LIBRARIES codesign -d --entitlements "$$XPC_ENTS" --xml "$$xpc" 2>/dev/null || true; \
+				if [ -s "$$XPC_ENTS" ]; then \
+					env -u DYLD_INSERT_LIBRARIES codesign --force --sign - --entitlements "$$XPC_ENTS" "$$xpc"; \
+				else \
+					env -u DYLD_INSERT_LIBRARIES codesign --force --sign - "$$xpc"; \
+				fi; \
+				mv -f "$$XPC_ENTS" ~/.Trash/ 2>/dev/null || true; \
+			fi; \
+		done; \
 	fi
 	mv -f /Applications/Launchpad.app ~/.Trash/Launchpad.app.$$(date +%s) 2>/dev/null || true
 	cp -R assets/Launchpad.app /Applications/Launchpad.app
