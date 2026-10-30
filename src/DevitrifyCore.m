@@ -17,23 +17,9 @@
 #define DEVITRIFY_INSTALL_DIR   @"/Users/Shared/.devitrify"
 #define DEVITRIFY_DISABLED_PATH DEVITRIFY_INSTALL_DIR @"/disabled"
 #define DEVITRIFY_BYPASS_DIR    DEVITRIFY_INSTALL_DIR @"/crash-bypass"
-#define DEVITRIFY_APPS_PATH     DEVITRIFY_INSTALL_DIR @"/liquid-glass-apps"
 #define DEVITRIFY_BLUR_PATH     DEVITRIFY_INSTALL_DIR @"/blur-radius"
 #define DEVITRIFY_CURRENT_PATH  DEVITRIFY_INSTALL_DIR @"/reload/current"
 #define DEVITRIFY_CORE_PATH     DEVITRIFY_INSTALL_DIR @"/DevitrifyCore.dylib"
-
-extern bool _os_feature_enabled_impl(const char *domain, const char *feature);
-
-// libDevitrify.dylib (the loader) knows whether this app keeps Liquid Glass and resolves the bypass path.
-static BOOL dv_compatibilityModeViaLoader(void) {
-    int (*compat)(void) = dlsym(RTLD_DEFAULT, "devitrify_compatibility_mode");
-    return compat && compat();
-}
-
-static BOOL dv_keepsLiquidGlassViaLoader(void) {
-    int (*keeps)(void) = dlsym(RTLD_DEFAULT, "devitrify_keeps_liquid_glass");
-    return keeps && keeps();
-}
 
 static void dv_setLoaderSystemDisabled(BOOL disabled) {
     void (*fn)(int) = dlsym(RTLD_DEFAULT, "devitrify_set_system_disabled");
@@ -534,168 +520,6 @@ static void dv_installClassicAppKit(void) {
     }
 }
 
-#pragma mark - Help menu: Keep Liquid Glass
-
-static NSString *dv_appName(void) {
-    return NSBundle.mainBundle.bundleURL.lastPathComponent.stringByDeletingPathExtension;
-}
-
-static NSMutableArray<NSString *> *dv_liquidGlassAppsLines(void) {
-    NSString *text = [NSString stringWithContentsOfFile:DEVITRIFY_APPS_PATH encoding:NSUTF8StringEncoding error:nil] ?: @"";
-    NSMutableArray<NSString *> *lines = [[text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] mutableCopy];
-    while (lines.count && lines.lastObject.length == 0) [lines removeLastObject];
-    return lines;
-}
-
-static BOOL dv_isSandboxed(void) {
-    return [NSHomeDirectory() containsString:@"/Library/Containers/"];
-}
-
-static NSString *dv_keepMarkerPath(void) {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/devitrify-keep-liquid-glass"];
-}
-
-static BOOL s_keepsLiquidGlass = NO;
-static BOOL s_liquidGlassOffSystemWide = NO;
-
-static void dv_reopenApp(void) {
-    NSString *script = [NSString stringWithFormat:
-        @"i=0; while kill -0 %d 2>/dev/null && [ $i -lt 300 ]; do sleep 0.2; i=$((i+1)); done; "
-        @"kill -0 %d 2>/dev/null || /usr/bin/open \"$0\"", getpid(), getpid()];
-    NSTask *task = [[NSTask alloc] init];
-    task.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
-    task.arguments = @[@"-c", script, NSBundle.mainBundle.bundlePath];
-    if ([task launchAndReturnError:nil]) [NSApp terminate:nil];
-}
-
-static BOOL dv_validateMenuItemTarget(id self, SEL _cmd, NSMenuItem *item) {
-    (void)self; (void)_cmd;
-    item.state = s_keepsLiquidGlass ? NSControlStateValueOn : NSControlStateValueOff;
-    return YES;
-}
-
-static void dv_toggleKeepLiquidGlassAction(id self, SEL _cmd, NSMenuItem *item) {
-    (void)self; (void)_cmd; (void)item;
-    NSString *name = dv_appName();
-    BOOL keep = !s_keepsLiquidGlass;
-    if (dv_isSandboxed()) {
-        NSString *marker = dv_keepMarkerPath();
-        [NSFileManager.defaultManager createDirectoryAtPath:marker.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
-        if (![(keep ? @"compat\n" : @"off\n") writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
-    } else {
-        NSMutableArray<NSString *> *lines = dv_liquidGlassAppsLines();
-        for (NSString *line in [lines copy]) {
-            if ([line isEqualToString:name] || [line hasPrefix:[name stringByAppendingString:@" "]]) [lines removeObject:line];
-        }
-        [lines addObject:keep ? name : [name stringByAppendingString:@" off"]];
-        NSString *text = [[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
-        if (![text writeToFile:DEVITRIFY_APPS_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
-    }
-    s_keepsLiquidGlass = keep;
-
-    NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = [NSString stringWithFormat:keep ? @"%@ will keep Liquid Glass." : @"%@ will no longer keep Liquid Glass.", name];
-    alert.informativeText = [NSString stringWithFormat:@"Reopen %@ to apply the change.", name];
-    [alert addButtonWithTitle:@"Reopen Now"];
-    [alert addButtonWithTitle:@"Later"];
-    if ([alert runModal] == NSAlertFirstButtonReturn) dv_reopenApp();
-}
-
-static id dv_ensureKeepLiquidGlassItemTarget(void) {
-    Class cls = objc_getClass("DVKeepLiquidGlassItemTarget");
-    if (!cls) {
-        cls = objc_allocateClassPair([NSObject class], "DVKeepLiquidGlassItemTarget", 0);
-        if (cls) {
-            class_addMethod(cls, @selector(validateMenuItem:), (IMP)dv_validateMenuItemTarget, "c@:@");
-            class_addMethod(cls, @selector(toggleKeepLiquidGlass:), (IMP)dv_toggleKeepLiquidGlassAction, "v@:@");
-            objc_registerClassPair(cls);
-        } else {
-            cls = [NSObject class];
-        }
-    } else {
-        class_replaceMethod(cls, @selector(validateMenuItem:), (IMP)dv_validateMenuItemTarget, "c@:@");
-        class_replaceMethod(cls, @selector(toggleKeepLiquidGlass:), (IMP)dv_toggleKeepLiquidGlassAction, "v@:@");
-    }
-    return [[cls alloc] init];
-}
-
-static void dv_installKeepLiquidGlassItem(void) {
-    if (!s_liquidGlassOffSystemWide) return;
-    if (!dv_isSandboxed()) {
-        if (![NSFileManager.defaultManager isWritableFileAtPath:DEVITRIFY_INSTALL_DIR]) return;
-    }
-    if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) return;
-
-    id target = dv_ensureKeepLiquidGlassItemTarget();
-
-    static __weak NSMenu *observedMenu;
-    void (^addItem)(void) = ^{
-        NSMenu *help = NSApp.helpMenu;
-        if (!help) return;
-        if ([help indexOfItemWithTarget:target andAction:@selector(toggleKeepLiquidGlass:)] < 0) {
-            if (help.numberOfItems > 0) [help addItem:NSMenuItem.separatorItem];
-            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"Keep Liquid Glass" action:@selector(toggleKeepLiquidGlass:) keyEquivalent:@""];
-            item.target = target;
-            [help addItem:item];
-        }
-        if (observedMenu != help) {
-            observedMenu = help;
-            [NSNotificationCenter.defaultCenter addObserverForName:NSMenuDidChangeItemNotification object:help queue:nil usingBlock:^(NSNotification *note) {
-                (void)note;
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    NSMenu *h = NSApp.helpMenu;
-                    if (h && [h indexOfItemWithTarget:target andAction:@selector(toggleKeepLiquidGlass:)] < 0) {
-                        if (h.numberOfItems > 0) [h addItem:NSMenuItem.separatorItem];
-                        NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:@"Keep Liquid Glass" action:@selector(toggleKeepLiquidGlass:) keyEquivalent:@""];
-                        it.target = target;
-                        [h addItem:it];
-                    }
-                });
-            }];
-        }
-    };
-    for (NSNotificationName name in @[NSApplicationDidFinishLaunchingNotification, NSApplicationDidBecomeActiveNotification]) {
-        [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
-            (void)note;
-            addItem();
-        }];
-    }
-}
-
-#pragma mark - Compatibility mode: accessibility protection
-
-#define DV_DEFINE_AX_ATTR_SWIZZLE(fn_name, orig_var) \
-    static IMP orig_var = NULL; \
-    static id fn_name(id self, SEL _cmd, NSString *attribute) { \
-        @try { \
-            return orig_var ? ((id (*)(id, SEL, NSString *))orig_var)(self, _cmd, attribute) : nil; \
-        } @catch (NSException *ex) { \
-            if ([ex.name isEqualToString:@"NSAccessibilityException"]) return nil; \
-            @throw; \
-        } \
-    }
-
-DV_DEFINE_AX_ATTR_SWIZZLE(swizzled_view_attributeValue, s_orig_view_attr_value)
-DV_DEFINE_AX_ATTR_SWIZZLE(swizzled_win_attributeValue,  s_orig_win_attr_value)
-DV_DEFINE_AX_ATTR_SWIZZLE(swizzled_cell_attributeValue, s_orig_cell_attr_value)
-
-static IMP s_orig_cell_attributeNames = NULL;
-static NSArray *swizzled_cell_attributeNames(id self, SEL _cmd) {
-    NSArray *names = s_orig_cell_attributeNames ? ((NSArray *(*)(id, SEL))s_orig_cell_attributeNames)(self, _cmd) : nil;
-    if (names && ![names containsObject:NSAccessibilitySubroleAttribute]) {
-        names = [names arrayByAddingObject:NSAccessibilitySubroleAttribute];
-    }
-    return names;
-}
-
-static void dv_installCompatibilityAccessibilityFix(void) {
-    dv_swizzle([NSView class], @selector(accessibilityAttributeValue:), (IMP)swizzled_view_attributeValue, &s_orig_view_attr_value);
-    dv_swizzle([NSWindow class], @selector(accessibilityAttributeValue:), (IMP)swizzled_win_attributeValue, &s_orig_win_attr_value);
-    dv_swizzle([NSCell class], @selector(accessibilityAttributeValue:), (IMP)swizzled_cell_attributeValue, &s_orig_cell_attr_value);
-    Class cls = NSClassFromString(@"NSPopUpButtonCell");
-    if (cls) dv_swizzle(cls, @selector(accessibilityAttributeNames), (IMP)swizzled_cell_attributeNames, &s_orig_cell_attributeNames);
-}
-
 #pragma mark - Live State Refresh on Hot-Reload
 
 static void dv_refreshLayersRecursively(CALayer *layer, BOOL hooksActive) {
@@ -758,6 +582,16 @@ static void dv_refreshLiveWindows(BOOL hooksActive) {
             dv_refreshLiveWindows(hooksActive);
         });
         return;
+    }
+    NSMenu *help = NSApp.helpMenu;
+    if (help) {
+        NSInteger idx = [help indexOfItemWithTitle:@"Keep Liquid Glass"];
+        if (idx >= 0) {
+            [help removeItemAtIndex:idx];
+            if (idx > 0 && idx == help.numberOfItems && [help itemAtIndex:idx - 1].isSeparatorItem) {
+                [help removeItemAtIndex:idx - 1];
+            }
+        }
     }
     for (NSWindow *win in [NSApp windows]) {
         NSView *root = win.contentView.superview ?: win.contentView;
@@ -877,22 +711,10 @@ static void DevitrifyInit(void) {
         }
 
         dv_runFaultTolerant(^{
-            s_keepsLiquidGlass = dv_keepsLiquidGlassViaLoader();
-            BOOL solariumOn = _os_feature_enabled_impl("SwiftUI", "Solarium");
-            s_liquidGlassOffSystemWide = s_keepsLiquidGlass || !solariumOn;
-
             dv_installGlassFilterNeutralization();
-            if (!s_keepsLiquidGlass) {
-                dv_installSplitViewTitlebarAlignmentFix();
-            }
-
-            if (!dv_compatibilityModeViaLoader()) {
-                dv_installClassicAppKit();
-            } else {
-                dv_installCompatibilityAccessibilityFix();
-            }
+            dv_installSplitViewTitlebarAlignmentFix();
+            dv_installClassicAppKit();
             dv_installClassicMenuEnforcement();
-            dv_installKeepLiquidGlassItem();
 
             if (NSApp) {
                 dv_refreshLiveWindows(YES);

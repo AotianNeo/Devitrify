@@ -142,10 +142,6 @@ sudo cp "./build/devitrify-menubar" "$INSTALL_DIR/devitrify-menubar"
 sudo chown root:wheel "$INSTALL_DIR/devitrify-menubar"
 sudo chmod 4755 "$INSTALL_DIR/devitrify-menubar"
 
-if [ ! -f "$INSTALL_DIR/liquid-glass-apps" ]; then
-    printf '# Apps that keep Liquid Glass while it is disabled, frosted by Devitrify.\n# One app name per line, for example: AlDente\n' > "$INSTALL_DIR/liquid-glass-apps"
-fi
-
 # Retire legacy standalone Launchpad agent if present
 if [ -f "$LEGACY_LAUNCHPAD_PLIST" ]; then
     launchctl unload "$LEGACY_LAUNCHPAD_PLIST" > /dev/null 2>&1 || true

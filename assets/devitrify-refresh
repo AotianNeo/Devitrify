@@ -4,7 +4,7 @@
 # Usage: devitrify-refresh [-n] [bundle-id ...]
 #   -n          only list what would be reloaded
 #   bundle-id   only consider these apps and services, and reload them even if they
-#               already have Devitrify loaded (e.g. after editing liquid-glass-apps)
+#               already have Devitrify loaded
 
 LOADER=/Users/Shared/.devitrify/libDevitrify.dylib
 FEATURE_FLAGS=/Library/Preferences/FeatureFlags/Domain/SwiftUI.plist

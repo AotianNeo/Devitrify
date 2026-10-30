@@ -65,25 +65,7 @@ Apps and services only load Devitrify when they launch. To reload the ones that 
 Add `-n` to only list them. Add bundle identifiers such as `com.apple.Music` to reload only those apps, even if they already have Devitrify loaded.
 
 ## Apps that use SwiftUI glass
-Apps built with SwiftUI's `.glassEffect()` lose their glass shapes and can render transparent when Liquid Glass is disabled globally. Devitrify handles this completely automatically across all apps: native glass rendering is active by default with all liquid refraction neutralized into crisp frosted blur, while AppKit controls and menus always remain 100% classic (22pt height, full dark shadows). You never need to manually whitelist apps.
-
-If you ever wish to explicitly disable glass for a specific app (opt-out blacklist), you can configure `/Users/Shared/.devitrify/liquid-glass-apps`, named by the app name without `.app`:
-
-```
-Calculator off
-```
-
-A line with only a name turns the compatibility mode on, `off` turns it off and `stable` keeps Liquid Glass with SwiftUI's own controls in the new style. Reload the app afterwards:
-
-```
-/Users/Shared/.devitrify/devitrify-refresh com.apphousekitchen.aldente-pro
-```
-
-Sandboxed apps, which include most apps that come with macOS, can't read that file. They keep a marker file in their own container instead, whose content is `compat`, `stable` or `off`:
-
-```
-echo off > ~/Library/Containers/com.apple.calculator/Data/Library/Application\ Support/devitrify-keep-liquid-glass
-```
+Apps built with SwiftUI's `.glassEffect()` lose their glass shapes and can render transparent when Liquid Glass is disabled globally. Devitrify handles this completely automatically across all apps: native glass rendering is active in `.compatibility` mode with all liquid refraction neutralized into crisp frosted blur, while AppKit and SwiftUI controls and menus always remain 100% classic (22pt height, full dark shadows). No per-app configuration or whitelist is needed.
 
 ## How it works
 - `libDevitrify.dylib` is injected into every process through `DYLD_INSERT_LIBRARIES`. It links nothing beyond `libSystem` and loads `DevitrifyCore.dylib` only into GUI processes that link `AppKit`, so command-line tools are unaffected.

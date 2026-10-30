@@ -20,8 +20,6 @@
 #define DEVITRIFY_DISABLED_FILE DEVITRIFY_INSTALL_DIR "/disabled"
 #define DEVITRIFY_BYPASS_DIR DEVITRIFY_INSTALL_DIR "/crash-bypass"
 
-static int s_keep_liquid_glass = 0;
-static int s_compatibility_mode = 0;
 static int s_appkit_loaded = 0;
 static volatile int s_system_disabled = 0;
 static volatile int s_process_bypassed = 0;
@@ -78,15 +76,6 @@ static void detect_loaded_frameworks(void) {
     }
 }
 
-int devitrify_keeps_liquid_glass(void) {
-    return s_keep_liquid_glass;
-}
-
-// 1 when the app runs Liquid Glass in compatibility mode, which already has classic controls.
-int devitrify_compatibility_mode(void) {
-    return s_compatibility_mode;
-}
-
 extern bool _os_feature_enabled_impl(const char *domain, const char *feature);
 
 // When Solarium is disabled system-wide, AppKit and SwiftUI controls must stay classic
@@ -113,7 +102,6 @@ static bool devitrify_feature_enabled(const char *domain, const char *feature) {
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "flexiGlassMacOS")) return true;
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) {
             const void *ret = __builtin_return_address(0);
-            if (s_keep_liquid_glass) return true;
             if (s_appkit_loaded && devitrify_caller_is_swift_feature_flags(ret)) {
                 s_in_solarium_compute_values = 1;
                 return true;
@@ -128,13 +116,7 @@ static bool devitrify_feature_enabled(const char *domain, const char *feature) {
     __attribute__((section("__DATA,__interpose"))) = { (const void *)(unsigned long)&replacement, (const void *)(unsigned long)&replacee }
 DYLD_INTERPOSE(devitrify_feature_enabled, _os_feature_enabled_impl);
 
-// Optional second level, "Name compat" in liquid-glass-apps: Liquid Glass runs in its
-// compatibility mode, the way apps built with an older SDK run on macOS 26 and later, so the
-// controls that SwiftUI draws stay classic as well while glass keeps its shape. dyld tells
-// frameworks which SDK the app was built with, so report macOS 15. Some SwiftUI controls
-// misbehave in this mode when accessibility clients are running, so it is opt-in.
 typedef struct { uint32_t platform; uint32_t version; } devitrify_build_version;
-extern uint32_t dyld_get_program_sdk_version(void);
 extern bool dyld_program_sdk_at_least(devitrify_build_version version);
 
 #define DEVITRIFY_COMPATIBILITY_SDK 0x000F0000
@@ -145,21 +127,11 @@ static bool devitrify_version_after_compat(devitrify_build_version version) {
     return version.version > limit;
 }
 
-// Only the frameworks that draw the interface get the older SDK. Other frameworks, such as
-// CoreFoundation, change behavior with the SDK too and misbehave when they are told one that
-// the app wasn't built with.
 static bool devitrify_caller_draws_interface(const void *address) {
     Dl_info info;
     if (!dladdr(address, &info) || !info.dli_fname) return false;
     return strstr(info.dli_fname, "/AppKit.framework/") || strstr(info.dli_fname, "/SwiftUI.framework/") ||
            strstr(info.dli_fname, "/SwiftUICore.framework/");
-}
-
-static uint32_t devitrify_program_sdk_version(void) {
-    uint32_t real = dyld_get_program_sdk_version();
-    if (s_system_disabled || s_process_bypassed) return real;
-    if (s_compatibility_mode && real > DEVITRIFY_COMPATIBILITY_SDK && devitrify_caller_draws_interface(__builtin_return_address(0))) return DEVITRIFY_COMPATIBILITY_SDK;
-    return real;
 }
 
 static bool devitrify_program_sdk_at_least(devitrify_build_version version) {
@@ -171,69 +143,10 @@ static bool devitrify_program_sdk_at_least(devitrify_build_version version) {
         s_in_solarium_compute_values = 0;
         return false;
     }
-    if (s_compatibility_mode && devitrify_version_after_compat(version) && devitrify_caller_draws_interface(__builtin_return_address(0))) return false;
     return dyld_program_sdk_at_least(version);
 }
 
-DYLD_INTERPOSE(devitrify_program_sdk_version, dyld_get_program_sdk_version);
 DYLD_INTERPOSE(devitrify_program_sdk_at_least, dyld_program_sdk_at_least);
-
-// Each source of a decision is "on" (compatibility mode), "stable", "off" or absent.
-enum { CHOICE_NONE, CHOICE_COMPAT, CHOICE_STABLE, CHOICE_OFF };
-
-static int choice_from_text(const char *text) {
-    if (!strncmp(text, "off", 3)) return CHOICE_OFF;
-    if (!strncmp(text, "stable", 6)) return CHOICE_STABLE;
-    return CHOICE_COMPAT;
-}
-
-static void keep_liquid_glass_if_listed(const char *dir) {
-    if (_os_feature_enabled_impl("SwiftUI", "Solarium")) return;
-
-    char executable[PATH_MAX];
-    uint32_t size = sizeof(executable);
-    if (_NSGetExecutablePath(executable, &size) != 0) return;
-
-    int choice = CHOICE_NONE;
-    if (strstr(executable, ".app/Contents/MacOS/")) {
-        const char *home = getenv("HOME");
-        if (home && strstr(home, "/Library/Containers/")) {
-            char marker[PATH_MAX];
-            snprintf(marker, sizeof(marker), "%s/Library/Application Support/devitrify-keep-liquid-glass", home);
-            FILE *file = fopen(marker, "r");
-            if (file) {
-                char text[16] = "";
-                if (!fgets(text, sizeof(text), file)) text[0] = '\0';
-                choice = choice_from_text(text);
-                fclose(file);
-            }
-        } else {
-            char list[PATH_MAX];
-            snprintf(list, sizeof(list), "%s/liquid-glass-apps", dir);
-            FILE *file = fopen(list, "r");
-            char line[256];
-            while (file && fgets(line, sizeof(line), file)) {
-                line[strcspn(line, "\r\n")] = '\0';
-                if (line[0] == '\0' || line[0] == '#') continue;
-                char *space = strrchr(line, ' ');
-                const char *option = "";
-                if (space && (!strcmp(space + 1, "off") || !strcmp(space + 1, "stable") || !strcmp(space + 1, "compat"))) {
-                    *space = '\0';
-                    option = space + 1;
-                }
-                char needle[PATH_MAX];
-                snprintf(needle, sizeof(needle), "/%s.app/Contents/MacOS/", line);
-                if (!strstr(executable, needle)) continue;
-                choice = choice_from_text(option);
-                break;
-            }
-            if (file) fclose(file);
-        }
-    }
-
-    if (choice == CHOICE_COMPAT || choice == CHOICE_STABLE) s_keep_liquid_glass = 1;
-    if (choice == CHOICE_COMPAT) s_compatibility_mode = 1;
-}
 
 // Crash-guard for dlopen(DevitrifyCore): if loading or initializing hooks triggers SIGSEGV/SIGBUS/SIGILL/SIGABRT,
 // record a per-process bypass marker and longjmp back so the host app continues running cleanly without hooks.
@@ -297,7 +210,6 @@ static void devitrify_load_core(void) {
     char *slash = strrchr(path, '/');
     if (!slash) return;
     *slash = '\0';
-    keep_liquid_glass_if_listed(path);
     detect_loaded_frameworks();
 
     if (!s_appkit_loaded) return;
