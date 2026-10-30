@@ -1,23 +1,55 @@
 #!/bin/sh
-# Runs at login. Applies the 33pt Solarium menu bar height in WindowServer, injects Devitrify
-# into every app launched from now on, then relaunches Control Center, Notification Center,
-# Spotlight (Siri AI / campo), and Rectangle if already started before the menu bar patch.
+# Unified Devitrify + Launchpad Revived login agent.
+# 1. Applies the 33pt Solarium menu bar height in WindowServer and sets DYLD_INSERT_LIBRARIES.
+# 2. Restores /Applications/Launchpad.app if deleted by a macOS update and launches the
+#    Launchpad-capable Dock with DynamicDesktop & WindowManager shims.
+# 3. Relaunches Control Center, Notification Center, Spotlight (Siri AI / campo), and Rectangle.
 
-/bin/launchctl setenv DYLD_INSERT_LIBRARIES /Users/Shared/.devitrify/libDevitrify.dylib
-if [ -x /Users/Shared/.devitrify/devitrify-menubar ]; then
+INSTALL_DIR=/Users/Shared/.devitrify
+
+/bin/launchctl setenv DYLD_INSERT_LIBRARIES "$INSTALL_DIR/libDevitrify.dylib"
+
+if [ -x "$INSTALL_DIR/devitrify-menubar" ]; then
     ws_before=$(/usr/bin/pgrep -x WindowServer)
-    /Users/Shared/.devitrify/devitrify-menubar >/dev/null 2>&1
+    "$INSTALL_DIR/devitrify-menubar" >/dev/null 2>&1
     /bin/sleep 0.5
     ws_after=$(/usr/bin/pgrep -x WindowServer)
     if [ -z "$ws_after" ] || [ "$ws_before" != "$ws_after" ]; then
         /bin/sleep 1.5
-        /Users/Shared/.devitrify/devitrify-menubar >/dev/null 2>&1
+        "$INSTALL_DIR/devitrify-menubar" >/dev/null 2>&1
     fi
 fi
-/bin/launchctl kickstart -k "gui/$(id -u)/com.apple.controlcenter"
-/bin/launchctl kickstart -k "gui/$(id -u)/com.apple.notificationcenterui.agent"
-/bin/launchctl kickstart -k "gui/$(id -u)/com.apple.campo" 2>/dev/null || true
-/bin/launchctl kickstart -k "gui/$(id -u)/com.apple.Spotlight" 2>/dev/null || true
+
+# Self-heal /Applications/Launchpad.app if a macOS update removed it
+if [ ! -d /Applications/Launchpad.app ] && [ -d "$INSTALL_DIR/Launchpad.app" ]; then
+    /bin/cp -R "$INSTALL_DIR/Launchpad.app" /Applications/Launchpad.app
+    /usr/bin/xattr -cr /Applications/Launchpad.app 2>/dev/null || true
+fi
+
+# Start the Launchpad-enabled Dock with DynamicDesktop and WindowManager shims
+if [ -x "$INSTALL_DIR/Dock.app/Contents/MacOS/Dock" ]; then
+    /bin/cp /System/Library/LaunchAgents/com.apple.Dock.plist "$INSTALL_DIR/com.apple.Dock.plist"
+    /usr/bin/plutil -replace EnvironmentVariables -xml "<dict/>" "$INSTALL_DIR/com.apple.Dock.plist"
+    if /usr/bin/defaults read /Library/Preferences/FeatureFlags/Domain/SwiftUI.plist Solarium 2>/dev/null | /usr/bin/grep -q "Enabled = 0" || \
+       [ -f /private/var/ammonia/core/tweaks/libBackToCatalinaDock.dylib ]; then
+        /usr/bin/plutil -replace EnvironmentVariables.FEATUREFLAGS_DISABLED -string "SwiftUI/Solarium" "$INSTALL_DIR/com.apple.Dock.plist"
+    fi
+    macos_major=$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d '.' -f 1)
+    if [ "$macos_major" -ge 27 ]; then
+        /usr/bin/plutil -replace EnvironmentVariables.DYLD_FRAMEWORK_PATH -string "$INSTALL_DIR/Frameworks" "$INSTALL_DIR/com.apple.Dock.plist"
+    fi
+    /usr/bin/plutil -replace Program -string "$INSTALL_DIR/Dock.app/Contents/MacOS/Dock" "$INSTALL_DIR/com.apple.Dock.plist"
+
+    /bin/launchctl unload /Users/Shared/.launchpad/com.apple.Dock.plist >/dev/null 2>&1 || true
+    /bin/launchctl unload "$INSTALL_DIR/com.apple.Dock.plist" >/dev/null 2>&1 || true
+    /bin/launchctl load "$INSTALL_DIR/com.apple.Dock.plist"
+    /bin/launchctl start com.apple.Dock.agent
+fi
+
+/bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.controlcenter"
+/bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.notificationcenterui.agent"
+/bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.campo" 2>/dev/null || true
+/bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.Spotlight" 2>/dev/null || true
 if /usr/bin/pgrep -x Rectangle >/dev/null 2>&1; then
     /usr/bin/killall Rectangle >/dev/null 2>&1 && /usr/bin/open -g -a Rectangle
 fi

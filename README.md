@@ -1,8 +1,8 @@
 # Devitrify
 
-Devitrify turns Liquid Glass back into frosted glass on macOS Tahoe and macOS Golden Gate.
+Devitrify turns Liquid Glass back into frosted glass on macOS Tahoe and macOS Golden Gate, and restores the classic macOS **Launchpad** (`Dock.app` + `Launchpad.app` with `DynamicDesktop` and `WindowManager` shims) in a single unified package.
 
-With Liquid Glass disabled, apps that still use glass views such as `NSGlassEffectView` draw them fully transparent, leaving text floating over whatever is behind the window. Devitrify replaces every one of them with classic frosted glass, without any per-app configuration. Where Liquid Glass stays on, it strips the refraction and keeps a plain blur.
+With Liquid Glass disabled, apps that still use glass views such as `NSGlassEffectView` draw them fully transparent, leaving text floating over whatever is behind the window. Devitrify replaces every one of them with classic frosted glass, without any per-app configuration. Where Liquid Glass stays on, it strips the refraction and keeps a plain blur. At the same time, it restores the classic Launchpad experience removed in macOS 26/27 and self-heals `/Applications/Launchpad.app` across macOS system updates.
 
 ## Usage
 1. [Turn off System Integrity Protection](https://developer.apple.com/documentation/security/disabling-and-enabling-system-integrity-protection) by running `csrutil disable` in recoveryOS
@@ -93,7 +93,8 @@ echo off > ~/Library/Containers/com.apple.calculator/Data/Library/Application\ S
   - `glassBackground` and `glassForeground` have their refraction (`inputLensingPower`, `inputRefractionHeight`), edge bleed (`inputBleedAmount`), and chromatic aberration (`inputAbberation` / `inputChromaticAberration`) zeroed out, with `inputBlurRadius` set to a uniform Gaussian frosted blur (`25pt` by default) while preserving native `inputShadow*` parameters.
   - `CASDFKeyFillHighlightEffect` has its `keyColor` and `fillColor` neutralized to `kCGColorClear` (`rgba(0,0,0,0)`), eliminating the 3D specular Liquid Glass rim across SwiftUI and `ControlCenter` tiles without breaking `CA::Render::SDFLayer` validation.
 - For AppKit `NSGlassEffectView` instances when `_NSSolariumEnabled` is `false`, `DevitrifyCore.dylib` inserts an `NSVisualEffectView` clipped to the glass corner radius (`BehindWindow` for root glass views, `WithinWindow` for nested controls).
-- `devitrify-menubar` keeps the compact 33-point notched menu bar height in `WindowServer` while `SwiftUI/Solarium` is disabled system-wide, dynamically resolving `SkyLight.framework` instructions without hardcoded offsets so it remains effective across macOS updates.
+- `devitrify-menubar` keeps the compact 33-point notched menu bar height in `WindowServer` while `SwiftUI/Solarium` is disabled system-wide, dynamically resolving `SkyLight.framework` instructions without hardcoded offsets so it remains effective across macOS updates. In addition, `DevitrifyCore.dylib` normalizes `-[NSCGSDisplay revealedMenuBarHeight]` and `-[NSScreen _layoutMenuBarHeight]` on notched displays to `notch.size.height + 1.0` (`33pt`) so window managers such as `Rectangle` always compute accurate screen frames.
+- `DynamicDesktop.framework` and `WindowManagerShim.dylib` are built from source (`src/DynamicDesktop-shim.c`, `src/WindowManager.swift`, `src/WindowManager-thunk.s`) into `/Users/Shared/.devitrify/Frameworks` so the Launchpad-capable `Dock.app` (`25A5316i`) and `Launchpad.app` (`25A5306g`) run natively on macOS 26 and macOS 27 under the single unified `com.devitrify.agent` LaunchAgent.
 
 ## Limitations
 - The custom tint color of `NSGlassEffectView` is approximated using standard `NSVisualEffectView` materials when `_NSSolariumEnabled` is `false`.

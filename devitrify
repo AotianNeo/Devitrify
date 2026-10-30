@@ -5,6 +5,7 @@ cd "$SCRIPT_DIR"
 
 INSTALL_DIR=/Users/Shared/.devitrify
 AGENT_PLIST=~/Library/LaunchAgents/com.devitrify.agent.plist
+LEGACY_LAUNCHPAD_PLIST=~/Library/LaunchAgents/com.launchpad.agent.plist
 FEATURE_FLAGS=/Library/Preferences/FeatureFlags/Domain/SwiftUI.plist
 
 macos_version=$(sw_vers -productVersion | cut -d '.' -f 1)
@@ -14,21 +15,30 @@ if [ "$macos_version" -lt 26 ] || [ "$macos_version" -gt 27 ]; then
 fi
 
 if [ -f "$INSTALL_DIR/DevitrifyCore.dylib" ]; then
-    printf "It appears that you have installed Devitrify.\n"
+    printf "It appears that you have installed Devitrify + Launchpad.\n"
     read -r -p "Do you want to uninstall it and restore system defaults? [Y/n] " response </dev/tty || exit 1
     case "$response" in
         [nN][oO]|[nN])
-            printf "Reinstalling Devitrify...\n"
+            printf "Reinstalling Devitrify + Launchpad...\n"
             ;;
         *)
             if [ -x "$INSTALL_DIR/devitrify-menubar" ]; then
                 "$INSTALL_DIR/devitrify-menubar" --restore > /dev/null 2>&1
             fi
             launchctl unload "$AGENT_PLIST" > /dev/null 2>&1
+            launchctl unload "$LEGACY_LAUNCHPAD_PLIST" > /dev/null 2>&1
+            launchctl unload "$INSTALL_DIR/com.apple.Dock.plist" > /dev/null 2>&1
+            launchctl unload /Users/Shared/.launchpad/com.apple.Dock.plist > /dev/null 2>&1
+            launchctl load /System/Library/LaunchAgents/com.apple.Dock.plist > /dev/null 2>&1
+            launchctl start com.apple.Dock.agent > /dev/null 2>&1
+
             if [ "$(launchctl getenv DYLD_INSERT_LIBRARIES)" = "$INSTALL_DIR/libDevitrify.dylib" ]; then
                 launchctl unsetenv DYLD_INSERT_LIBRARIES
             fi
-            rm -f "$INSTALL_DIR/DevitrifyCore.dylib" "$INSTALL_DIR/devitrify-agent" "$INSTALL_DIR/devitrify-refresh" "$INSTALL_DIR/devitrify-menubar"
+            mv -f "$INSTALL_DIR/DevitrifyCore.dylib" "$INSTALL_DIR/devitrify-agent" \
+                  "$INSTALL_DIR/devitrify-refresh" "$INSTALL_DIR/devitrify-menubar" \
+                  "$INSTALL_DIR/Dock.app" "$INSTALL_DIR/Launchpad.app" \
+                  /Applications/Launchpad.app "$LEGACY_LAUNCHPAD_PLIST" ~/.Trash/ 2>/dev/null || true
 
             # Processes started while Devitrify was installed still carry DYLD_INSERT_LIBRARIES,
             # and anything they launch fails without the loader. Remove it at next login instead.
@@ -43,7 +53,7 @@ if [ -f "$INSTALL_DIR/DevitrifyCore.dylib" ]; then
     <array>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>rm -rf $INSTALL_DIR; rm -f "\$HOME/Library/LaunchAgents/com.devitrify.agent.plist"</string>
+        <string>mv -f $INSTALL_DIR "\$HOME/Library/LaunchAgents/com.devitrify.agent.plist" ~/.Trash/ 2>/dev/null || true</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -54,12 +64,12 @@ EOF
             launchctl kickstart -k "gui/$(id -u)/com.apple.notificationcenterui.agent"
             launchctl kickstart -k "gui/$(id -u)/com.apple.campo" 2>/dev/null || true
             launchctl kickstart -k "gui/$(id -u)/com.apple.Spotlight" 2>/dev/null || true
-            printf "Devitrify has been uninstalled. Log out and back in to finish.\n"
+            printf "Devitrify + Launchpad have been uninstalled. Log out and back in to finish.\n"
             exit 0
             ;;
     esac
 else
-    printf "Installing Devitrify...\n"
+    printf "Installing Devitrify + Launchpad...\n"
 fi
 
 if csrutil status | grep -q "disabled"; then
@@ -77,15 +87,19 @@ case " $current_boot_args " in
     *) missing="$missing amfi_get_out_of_my_way=0x1" ;;
 esac
 case " $current_boot_args " in
+    *" ipc_control_port_options=0 "*) ;;
+    *) missing="$missing ipc_control_port_options=0" ;;
+esac
+case " $current_boot_args " in
     *" -arm64e_preview_abi "*) ;;
     *) missing="$missing -arm64e_preview_abi" ;;
 esac
 
 if [ -z "$missing" ]; then
-    printf "✅ AMFI is permissive (amfi_get_out_of_my_way and -arm64e_preview_abi are set).\n"
+    printf "✅ AMFI is permissive (amfi_get_out_of_my_way, ipc_control_port_options=0, and -arm64e_preview_abi are set).\n"
 else
-    printf 'Devitrify loads into apps signed by Apple and other developers, which requires a\n'
-    printf 'permissive AMFI. The following boot argument(s) are missing:%s\n' "$missing"
+    printf 'Devitrify + Launchpad requires a permissive AMFI so injected dylibs and the re-signed\n'
+    printf 'arm64e Dock work across apps. The following boot argument(s) are missing:%s\n' "$missing"
     printf '\n'
     read -r -p "Add them to your existing boot-args? [Y/n] " response </dev/tty || exit 1
     case "$response" in
@@ -121,21 +135,8 @@ if ! xcrun --find clang > /dev/null 2>&1; then
     exit 1
 fi
 
-printf 'Building Devitrify...\n'
-make clean all > /dev/null || exit 1
-
-printf 'Copying Devitrify to %s...\n' "$INSTALL_DIR"
-mkdir -p "$INSTALL_DIR"
-# Running apps map the installed dylibs; replace them instead of overwriting in place.
-for file in libDevitrify.dylib DevitrifyCore.dylib; do
-    cp "./build/$file" "$INSTALL_DIR/$file.new"
-    mv -f "$INSTALL_DIR/$file.new" "$INSTALL_DIR/$file"
-done
-for script in devitrify-agent devitrify-refresh; do
-    xattr -c "./assets/$script"
-    cp "./assets/$script" "$INSTALL_DIR"
-    chmod +x "$INSTALL_DIR/$script"
-done
+printf 'Building and installing Devitrify + Launchpad...\n'
+make clean install-launchpad || exit 1
 
 sudo cp "./build/devitrify-menubar" "$INSTALL_DIR/devitrify-menubar"
 sudo chown root:wheel "$INSTALL_DIR/devitrify-menubar"
@@ -145,7 +146,17 @@ if [ ! -f "$INSTALL_DIR/liquid-glass-apps" ]; then
     printf '# Apps that keep Liquid Glass while it is disabled, frosted by Devitrify.\n# One app name per line, for example: AlDente\n' > "$INSTALL_DIR/liquid-glass-apps"
 fi
 
-printf 'Loading Devitrify into apps...\n'
+# Retire legacy standalone Launchpad agent if present
+if [ -f "$LEGACY_LAUNCHPAD_PLIST" ]; then
+    launchctl unload "$LEGACY_LAUNCHPAD_PLIST" > /dev/null 2>&1 || true
+    mv -f "$LEGACY_LAUNCHPAD_PLIST" ~/.Trash/ 2>/dev/null || true
+fi
+if [ -d /Users/Shared/.launchpad ]; then
+    launchctl unload /Users/Shared/.launchpad/com.apple.Dock.plist > /dev/null 2>&1 || true
+    mv -f /Users/Shared/.launchpad ~/.Trash/launchpad-legacy.$(date +%s) 2>/dev/null || true
+fi
+
+printf 'Loading unified Devitrify + Launchpad agent...\n'
 xattr -c ./assets/com.devitrify.agent.plist
 mkdir -p ~/Library/LaunchAgents
 cp ./assets/com.devitrify.agent.plist ~/Library/LaunchAgents
@@ -153,9 +164,9 @@ launchctl unload "$AGENT_PLIST" > /dev/null 2>&1
 launchctl load "$AGENT_PLIST"
 
 if defaults read "$FEATURE_FLAGS" Solarium 2>/dev/null | grep -q "Enabled = 0"; then
-    printf 'Liquid Glass is disabled: glass panels now fall back to frosted glass.\n'
+    printf 'Liquid Glass is disabled: glass panels now fall back to frosted glass, and Launchpad is active.\n'
 else
-    printf 'Liquid Glass is enabled: refraction is now removed from glass. See the README to disable Liquid Glass.\n'
+    printf 'Liquid Glass is enabled: refraction is removed from glass, and Launchpad is active. See the README to disable Liquid Glass.\n'
 fi
 printf 'Done!\n'
 
