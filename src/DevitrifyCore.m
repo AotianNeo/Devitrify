@@ -8,6 +8,8 @@
 #import <setjmp.h>
 #import <libkern/OSCacheControl.h>
 #import <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <mach-o/getsect.h>
 #if __has_feature(ptrauth_calls)
 #import <ptrauth.h>
 #endif
@@ -151,6 +153,58 @@ static void dv_restoreAllSwizzlesAndPatches(void) {
 
 #pragma mark - Classic menu enforcement
 
+static uint64_t dv_decodeAdrpAdd(const uint32_t *insns, uint32_t reg) {
+    uint32_t i0 = insns[0], i1 = insns[1];
+    if ((i0 & 0x9f00001f) != (0x90000000 | reg)) return 0;
+    if ((i1 & 0xff8003ff) != (0x91000000 | (reg << 5) | reg)) return 0;
+    int64_t immlo = (i0 >> 29) & 0x3;
+    int64_t immhi = (int64_t)((int32_t)(i0 << 8) >> 13);
+    int64_t page_off = ((immhi << 2) | immlo) << 12;
+    uint64_t pc_page = ((uint64_t)insns) & ~0xfffULL;
+    return (uint64_t)((int64_t)pc_page + page_off) + ((i1 >> 10) & 0xfff);
+}
+
+static NSArray<NSValue *> *dv_appKitMenuGlassCachePointers(void) {
+    Class host = [NSApplication class];
+    const void *assocKey = (const void *)sel_registerName("dv_appKitMenuGlassCachePointers");
+    NSArray<NSValue *> *cached = objc_getAssociatedObject(host, assocKey);
+    if (cached) return cached;
+
+    NSMutableSet<NSValue *> *ptrs = [NSMutableSet set];
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "/AppKit.framework/Versions/C/AppKit")) continue;
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        unsigned long text_sz = 0, cf_sz = 0;
+        const uint32_t *code = (const uint32_t *)getsectiondata(mh, "__TEXT", "__text", &text_sz);
+        const uint8_t *cf = (const uint8_t *)getsectiondata(mh, "__AUTH_CONST", "__cfstring", &cf_sz);
+        if (!cf) cf = (const uint8_t *)getsectiondata(mh, "__DATA_CONST", "__cfstring", &cf_sz);
+        if (!code || !cf) break;
+        size_t n = text_sz / 4;
+        for (size_t k = 0; k + 4 < n; k++) {
+            uint64_t cf_addr = dv_decodeAdrpAdd(&code[k], 0);
+            if (cf_addr < (uint64_t)cf || cf_addr + 32 > (uint64_t)cf + cf_sz) continue;
+            uint64_t cache_addr = dv_decodeAdrpAdd(&code[k + 2], 2);
+            if (!cache_addr) continue;
+            NSString *s = (__bridge NSString *)(const void *)cf_addr;
+            if ([s hasPrefix:@"NSGlassMenu"] || [s isEqualToString:@"NSMenuUseGlassWindowStyle"]) {
+                [ptrs addObject:[NSValue valueWithPointer:(const void *)cache_addr]];
+            }
+        }
+        break;
+    }
+    cached = [ptrs allObjects];
+    objc_setAssociatedObject(host, assocKey, cached, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return cached;
+}
+
+static void dv_setAppKitMenuGlassCache(uint8_t val) {
+    for (NSValue *v in dv_appKitMenuGlassCachePointers()) {
+        uint8_t *p = (uint8_t *)v.pointerValue;
+        if (p) __atomic_store_n(p, val, __ATOMIC_RELEASE);
+    }
+}
+
 static IMP s_orig_boolForKey = NULL;
 static BOOL swizzled_boolForKey(NSUserDefaults *self, SEL _cmd, NSString *key) {
     if ([key hasPrefix:@"NSGlassMenu"] || [key isEqualToString:@"NSMenuUseGlassWindowStyle"]) {
@@ -172,12 +226,31 @@ static CGFloat swizzled_cgsDisplay_revealedMenuBarHeight(id self, SEL _cmd) {
     SEL notchSel = NSSelectorFromString(@"notchFrame");
     if ([self respondsToSelector:notchSel]) {
         NSRect notch = ((NSRect (*)(id, SEL))objc_msgSend)(self, notchSel);
-        if (notch.size.height > 0.0 && (h == 0.0 || h > notch.size.height + 1.0)) {
+        if (notch.size.height > 0.0 && h > notch.size.height + 1.0) {
             return notch.size.height + 1.0;
         }
     }
     return h;
 }
+
+#define DV_DEFINE_SCREEN_MENUBAR_SWIZZLE(fn_name, orig_var) \
+    static IMP orig_var = NULL; \
+    static CGFloat fn_name(id self, SEL _cmd) { \
+        CGFloat h = orig_var ? ((CGFloat (*)(id, SEL))orig_var)(self, _cmd) : 0.0; \
+        SEL notchSel = NSSelectorFromString(@"_notchFrame"); \
+        if (h > 0.0 && [self respondsToSelector:notchSel]) { \
+            NSRect notch = ((NSRect (*)(id, SEL))objc_msgSend)(self, notchSel); \
+            if (notch.size.height > 0.0 && h > notch.size.height + 1.0) { \
+                return notch.size.height + 1.0; \
+            } \
+        } \
+        return h; \
+    }
+
+DV_DEFINE_SCREEN_MENUBAR_SWIZZLE(swizzled_screen_layoutMenuBarHeight, s_orig_screen_layoutMenuBarHeight)
+DV_DEFINE_SCREEN_MENUBAR_SWIZZLE(swizzled_screen_revealedMenuBarHeight, s_orig_screen_revealedMenuBarHeight)
+DV_DEFINE_SCREEN_MENUBAR_SWIZZLE(swizzled_screen_restingMenuBarHeight, s_orig_screen_restingMenuBarHeight)
+DV_DEFINE_SCREEN_MENUBAR_SWIZZLE(swizzled_screen_layoutForcingRevealedMenuBarHeight, s_orig_screen_layoutForcingRevealedMenuBarHeight)
 
 static void dv_installClassicMenuEnforcement(void) {
     dv_swizzle([NSUserDefaults class], @selector(boolForKey:), (IMP)swizzled_boolForKey, &s_orig_boolForKey);
@@ -193,6 +266,18 @@ static void dv_installClassicMenuEnforcement(void) {
                    (IMP)swizzled_cgsDisplay_revealedMenuBarHeight, &s_orig_cgsDisplay_revealedMenuBarHeight);
     }
 
+    Class screenCls = [NSScreen class];
+    if (screenCls) {
+        dv_swizzle(screenCls, NSSelectorFromString(@"_layoutMenuBarHeight"),
+                   (IMP)swizzled_screen_layoutMenuBarHeight, &s_orig_screen_layoutMenuBarHeight);
+        dv_swizzle(screenCls, NSSelectorFromString(@"_revealedMenuBarHeight"),
+                   (IMP)swizzled_screen_revealedMenuBarHeight, &s_orig_screen_revealedMenuBarHeight);
+        dv_swizzle(screenCls, NSSelectorFromString(@"_restingMenuBarHeight"),
+                   (IMP)swizzled_screen_restingMenuBarHeight, &s_orig_screen_restingMenuBarHeight);
+        dv_swizzle(screenCls, NSSelectorFromString(@"_layoutForcingRevealedMenuBarHeight"),
+                   (IMP)swizzled_screen_layoutForcingRevealedMenuBarHeight, &s_orig_screen_layoutForcingRevealedMenuBarHeight);
+    }
+
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         @"NSGlassMenusEnabled": @NO,
         @"NSGlassMenuLayoutEnabled": @NO,
@@ -200,6 +285,7 @@ static void dv_installClassicMenuEnforcement(void) {
         @"NSGlassMenusUsePlainBorderView": @NO,
         @"NSGlassMenuContentAboveGlass": @NO,
     }];
+    dv_setAppKitMenuGlassCache(2);
 }
 
 #pragma mark - Solarium ON: glass filters -> plain Gaussian blur
@@ -684,6 +770,8 @@ static void dv_refreshLiveWindows(BOOL hooksActive) {
             }
         }
     }
+    [NSNotificationCenter.defaultCenter postNotificationName:NSApplicationDidChangeScreenParametersNotification
+                                                      object:NSApp];
 }
 
 #pragma mark - Fault-Tolerant Execution Guard & Hot-Reload Listener
@@ -781,6 +869,7 @@ static void DevitrifyInit(void) {
 
         if (sysDisabled || procBypassed) {
             dv_restoreAllSwizzlesAndPatches();
+            dv_setAppKitMenuGlassCache(0);
             if (NSApp) {
                 dv_refreshLiveWindows(NO);
             }

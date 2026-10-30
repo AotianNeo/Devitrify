@@ -228,23 +228,25 @@ int main(int argc, char **argv) {
     }
 
     uint32_t desired_insn = restore ? targets.orig_solarium_bl : mov_w0_1;
-    if (!patch_word(task, addr_solarium, desired_insn)) {
-        fprintf(stderr, "devitrify-menubar: failed to patch solarium_menubar_enabled.\n");
-        return 1;
+    if (cur_solarium != desired_insn) {
+        if (!patch_word(task, addr_solarium, desired_insn)) {
+            fprintf(stderr, "devitrify-menubar: failed to patch solarium_menubar_enabled.\n");
+            return 1;
+        }
+
+        if (!patch_word(task, addr_sarlacc_show, bl_pkg_changed)) {
+            fprintf(stderr, "devitrify-menubar: failed to patch _XSetSarlaccPathShow.\n");
+            return 1;
+        }
+
+        SLSDumpSarlaccCGPath();
+        usleep(100000);
+        SLSSetSarlaccPathShow(0);
+        usleep(200000);
+        unlink("/tmp/sarlacc_path.txt");
+
+        patch_word(task, addr_sarlacc_show, targets.orig_sarlacc_show_bl);
     }
-
-    if (!patch_word(task, addr_sarlacc_show, bl_pkg_changed)) {
-        fprintf(stderr, "devitrify-menubar: failed to patch _XSetSarlaccPathShow.\n");
-        return 1;
-    }
-
-    SLSDumpSarlaccCGPath();
-    usleep(100000);
-    SLSSetSarlaccPathShow(0);
-    usleep(200000);
-    unlink("/tmp/sarlacc_path.txt");
-
-    patch_word(task, addr_sarlacc_show, targets.orig_sarlacc_show_bl);
 
     uint32_t h_after = 0;
     SLSGetDisplayMenubarHeight(CGMainDisplayID(), &h_after);

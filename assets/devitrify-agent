@@ -5,7 +5,14 @@
 
 /bin/launchctl setenv DYLD_INSERT_LIBRARIES /Users/Shared/.devitrify/libDevitrify.dylib
 if [ -x /Users/Shared/.devitrify/devitrify-menubar ]; then
+    ws_before=$(/usr/bin/pgrep -x WindowServer)
     /Users/Shared/.devitrify/devitrify-menubar >/dev/null 2>&1
+    /bin/sleep 0.5
+    ws_after=$(/usr/bin/pgrep -x WindowServer)
+    if [ -z "$ws_after" ] || [ "$ws_before" != "$ws_after" ]; then
+        /bin/sleep 1.5
+        /Users/Shared/.devitrify/devitrify-menubar >/dev/null 2>&1
+    fi
 fi
 /bin/launchctl kickstart -k "gui/$(id -u)/com.apple.controlcenter"
 /bin/launchctl kickstart -k "gui/$(id -u)/com.apple.notificationcenterui.agent"
