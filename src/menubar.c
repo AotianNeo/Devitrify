@@ -153,15 +153,21 @@ static pid_t find_windowserver_pid(void) {
 
 static bool patch_word(mach_port_t task, mach_vm_address_t addr, uint32_t val) {
     mach_vm_address_t page = addr & ~0x3fffULL;
+    bool suspended = (task_suspend(task) == KERN_SUCCESS);
     kern_return_t kr = mach_vm_protect(task, page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
         kr = mach_vm_protect(task, page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     }
-    if (kr != KERN_SUCCESS) return false;
+    if (kr != KERN_SUCCESS) {
+        if (suspended) task_resume(task);
+        return false;
+    }
     kr = mach_vm_write(task, addr, (vm_offset_t)&val, sizeof(val));
-    if (kr != KERN_SUCCESS) return false;
-    kr = mach_vm_protect(task, page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-    return kr == KERN_SUCCESS;
+    kern_return_t kr_prot = mach_vm_protect(task, page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    vm_machine_attribute_val_t mattr_val = MATTR_VAL_ICACHE_FLUSH;
+    mach_vm_machine_attribute(task, page, 0x4000, MATTR_CACHE, &mattr_val);
+    if (suspended) task_resume(task);
+    return kr == KERN_SUCCESS && kr_prot == KERN_SUCCESS;
 }
 
 int main(int argc, char **argv) {

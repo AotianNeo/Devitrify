@@ -164,12 +164,33 @@ static NSInteger swizzled_shadowOptions(id self, SEL _cmd) {
     return 2;
 }
 
+static IMP s_orig_cgsDisplay_revealedMenuBarHeight = NULL;
+static CGFloat swizzled_cgsDisplay_revealedMenuBarHeight(id self, SEL _cmd) {
+    CGFloat h = s_orig_cgsDisplay_revealedMenuBarHeight
+        ? ((CGFloat (*)(id, SEL))s_orig_cgsDisplay_revealedMenuBarHeight)(self, _cmd)
+        : 0.0;
+    SEL notchSel = NSSelectorFromString(@"notchFrame");
+    if ([self respondsToSelector:notchSel]) {
+        NSRect notch = ((NSRect (*)(id, SEL))objc_msgSend)(self, notchSel);
+        if (notch.size.height > 0.0 && (h == 0.0 || h > notch.size.height + 1.0)) {
+            return notch.size.height + 1.0;
+        }
+    }
+    return h;
+}
+
 static void dv_installClassicMenuEnforcement(void) {
     dv_swizzle([NSUserDefaults class], @selector(boolForKey:), (IMP)swizzled_boolForKey, &s_orig_boolForKey);
 
     Class popupCls = NSClassFromString(@"NSPopupMenuWindow");
     if (popupCls) {
         dv_swizzle(popupCls, @selector(shadowOptions), (IMP)swizzled_shadowOptions, NULL);
+    }
+
+    Class cgsDisplayCls = NSClassFromString(@"NSCGSDisplay");
+    if (cgsDisplayCls) {
+        dv_swizzle(cgsDisplayCls, NSSelectorFromString(@"revealedMenuBarHeight"),
+                   (IMP)swizzled_cgsDisplay_revealedMenuBarHeight, &s_orig_cgsDisplay_revealedMenuBarHeight);
     }
 
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{

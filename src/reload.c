@@ -7,11 +7,6 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-#include <mach-o/loader.h>
-#include <libproc.h>
-#include <pthread.h>
 
 #define INSTALL_DIR "/Users/Shared/.devitrify"
 #define RELOAD_DIR INSTALL_DIR "/reload"
@@ -92,69 +87,6 @@ static void print_status(void) {
     }
 }
 
-// In-memory AppKit menu cache patch across running processes
-static void patch_appkit_menu_cache_for_pid(pid_t pid, uint8_t menu_val) {
-    mach_port_t task = MACH_PORT_NULL;
-    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS || !MACH_PORT_VALID(task)) {
-        return;
-    }
-
-    // AppKit tri-state: 0=unset, 1=true (glass), 2=false (classic)
-    mach_vm_write(task, 0x209473338ULL, (vm_offset_t)&menu_val, 1); // sGlassMenusEnabled
-    mach_vm_write(task, 0x209473339ULL, (vm_offset_t)&menu_val, 1); // sGlassMenuLayoutEnabled
-    mach_vm_write(task, 0x209439c20ULL, (vm_offset_t)&menu_val, 1); // sMenuUseGlassWindowStyle
-
-    const uint64_t zero_ptr = 0;
-    mach_vm_write(task, 0x20943e4b8ULL, (vm_offset_t)&zero_ptr, 8); // sReusablePopupMenuWindow
-
-    mach_port_deallocate(mach_task_self(), task);
-}
-
-typedef struct {
-    pid_t *pids;
-    int start;
-    int end;
-    uint8_t menu_val;
-} worker_arg_t;
-
-static void *worker_patch(void *arg) {
-    worker_arg_t *w = (worker_arg_t *)arg;
-    for (int i = w->start; i < w->end; i++) {
-        patch_appkit_menu_cache_for_pid(w->pids[i], w->menu_val);
-    }
-    return NULL;
-}
-
-static void broadcast_cache_patch(uint8_t menu_val) {
-    int max_pids = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    if (max_pids <= 0) return;
-    pid_t *pids = malloc(max_pids * sizeof(pid_t));
-    int bytes = proc_listpids(PROC_ALL_PIDS, 0, pids, max_pids * sizeof(pid_t));
-    int count = bytes / sizeof(pid_t);
-
-    #define NUM_THREADS 8
-    pthread_t threads[NUM_THREADS];
-    worker_arg_t args[NUM_THREADS];
-    int chunk = (count + NUM_THREADS - 1) / NUM_THREADS;
-
-    for (int t = 0; t < NUM_THREADS; t++) {
-        args[t].pids = pids;
-        args[t].start = t * chunk;
-        args[t].end = (t + 1) * chunk;
-        args[t].menu_val = menu_val;
-        if (args[t].end > count) args[t].end = count;
-        if (args[t].start < args[t].end) {
-            pthread_create(&threads[t], NULL, worker_patch, &args[t]);
-        } else {
-            threads[t] = 0;
-        }
-    }
-    for (int t = 0; t < NUM_THREADS; t++) {
-        if (threads[t]) pthread_join(threads[t], NULL);
-    }
-    free(pids);
-}
-
 int main(int argc, char **argv) {
     ensure_directories();
 
@@ -223,9 +155,6 @@ int main(int argc, char **argv) {
 
     printf("[Devitrify Hot-Reload] Broadcasting notify '%s'...\n", NOTIFY_NAME);
     notify_post(NOTIFY_NAME);
-
-    // 2 = classic menus (false), 0 = reset to system default when disabled
-    broadcast_cache_patch(is_currently_disabled ? 0 : 2);
 
     if (is_currently_disabled) {
         printf("[Devitrify Hot-Reload] ✅ All Devitrify hooks unhooked and disabled system-wide across running apps!\n");
