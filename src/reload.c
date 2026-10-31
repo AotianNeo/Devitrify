@@ -75,7 +75,8 @@ static void restart_iconservicesagent_if_needed(void) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
         "/usr/bin/killall -9 iconservicesagent 2>/dev/null; "
-        "/bin/launchctl kickstart -k gui/%d/com.apple.iconservices.iconservicesagent 2>/dev/null", (int)uid);
+        "/bin/launchctl kickstart -k gui/%d/com.apple.iconservices.iconservicesagent 2>/dev/null; "
+        "/usr/bin/killall Finder 2>/dev/null", (int)uid);
     (void)system(cmd);
 }
 

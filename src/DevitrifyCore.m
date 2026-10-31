@@ -11,6 +11,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
 #import <sys/sysctl.h>
+#import <ImageIO/ImageIO.h>
 #if __has_feature(ptrauth_calls)
 #import <ptrauth.h>
 #endif
@@ -1004,6 +1005,30 @@ static BOOL swizzled_iconStack_returnNo(id self, SEL _cmd) {
     return NO;
 }
 
+static IMP s_orig_cgimage_with_data = NULL;
+static CGImageRef swizzled_CGImageWithData_iconIndexInfo(id self, SEL _cmd, NSData *data, void *iconIndexInfo) {
+    if (data.length >= 8) {
+        const uint8_t *bytes = (const uint8_t *)data.bytes;
+        // If data is modern compressed image format (PNG, JPEG 2000, JPEG, etc.),
+        // decode via ImageIO rather than letting legacy QuickDraw table treat compressed bytes as raw pixels.
+        if ((bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N' && bytes[3] == 'G') ||
+            (bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0x00 && bytes[3] == 0x0c) ||
+            (bytes[0] == 0xff && bytes[1] == 0x4f) ||
+            (bytes[0] == 0xff && bytes[1] == 0xd8)) {
+            CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+            if (src) {
+                CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+                CFRelease(src);
+                if (img) return img;
+            }
+        }
+    }
+    if (s_orig_cgimage_with_data) {
+        return ((CGImageRef(*)(id, SEL, NSData *, void *))s_orig_cgimage_with_data)(self, _cmd, data, iconIndexInfo);
+    }
+    return NULL;
+}
+
 static IMP s_orig_resourceWithBundleURL = NULL;
 static id swizzled_resourceWithBundleURL(id self, SEL _cmd, NSURL *url, NSDictionary *dict, NSUInteger options) {
     // Clear bit 8 (0x8) which forces iconStackResourcesAllowed wrapping
@@ -1109,6 +1134,11 @@ static void dv_installIconJailNeutralization(void) {
     Class clsMultisized = objc_getClass("ISMultisizedAppAssetCatalogResource");
     if (clsMultisized) {
         dv_swizzle(clsMultisized, sel_registerName("imageForSize:scale:"), (IMP)swizzled_multisizedApp_imageForSize_scale, &s_orig_multisizedApp_imageForSize_scale);
+    }
+
+    Class clsIcns = objc_getClass("ISIcns");
+    if (clsIcns) {
+        dv_swizzle(clsIcns, sel_registerName("CGImageWithData:iconIndexInfo:"), (IMP)swizzled_CGImageWithData_iconIndexInfo, &s_orig_cgimage_with_data);
     }
 }
 
