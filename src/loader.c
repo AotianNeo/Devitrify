@@ -69,7 +69,7 @@ static void detect_loaded_frameworks(void) {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
-        if (name && (strstr(name, "/AppKit.framework/") || strstr(name, "/LoginUIKit.framework/"))) {
+        if (name && strstr(name, "/AppKit.framework/")) {
             s_appkit_loaded = 1;
             break;
         }
