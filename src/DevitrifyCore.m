@@ -1140,6 +1140,17 @@ static void dv_installIconJailNeutralization(void) {
     if (clsIcns) {
         dv_swizzle(clsIcns, sel_registerName("CGImageWithData:iconIndexInfo:"), (IMP)swizzled_CGImageWithData_iconIndexInfo, &s_orig_cgimage_with_data);
     }
+
+    // Dock tile & appearance chiclet neutralization
+    Class clsTileLayer = objc_getClass("DOCKTileLayer");
+    if (clsTileLayer) {
+        dv_swizzle(clsTileLayer, sel_registerName("_requiresGlassBackground"), (IMP)swizzled_iconStack_returnNo, NULL);
+    }
+    Class clsIconAppearance = objc_getClass("IconAppearance");
+    if (clsIconAppearance) {
+        dv_swizzle(clsIconAppearance, sel_registerName("requiresGlassBackground"), (IMP)swizzled_iconStack_returnNo, NULL);
+        dv_swizzle(clsIconAppearance, sel_registerName("requiresDarkGlassBackground"), (IMP)swizzled_iconStack_returnNo, NULL);
+    }
 }
 
 static void dv_installHotReloadListenerIfNeeded(void) {

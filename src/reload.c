@@ -57,7 +57,7 @@ static void move_to_trash_or_unlink(const char *src, const char *filename) {
 static void purge_icon_cache_to_trash(void) {
     char cache_dir[PATH_MAX];
     if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache_dir, sizeof(cache_dir)) > 0) {
-        const char *targets[] = { "com.apple.iconservices", "com.apple.iconservicesagent", NULL };
+        const char *targets[] = { "com.apple.iconservices", "com.apple.iconservicesagent", "com.apple.dock.iconcache", NULL };
         for (int i = 0; targets[i]; i++) {
             char p[PATH_MAX];
             snprintf(p, sizeof(p), "%s%s", cache_dir, targets[i]);
@@ -68,6 +68,18 @@ static void purge_icon_cache_to_trash(void) {
             }
         }
     }
+
+    char user_dir[PATH_MAX];
+    if (confstr(_CS_DARWIN_USER_DIR, user_dir, sizeof(user_dir)) > 0) {
+        char lp_db[PATH_MAX];
+        snprintf(lp_db, sizeof(lp_db), "%s0/com.apple.dock.launchpad/db/db", user_dir);
+        if (access(lp_db, F_OK) == 0) {
+            char sql_cmd[PATH_MAX + 128];
+            snprintf(sql_cmd, sizeof(sql_cmd),
+                "/usr/bin/sqlite3 \"%s\" \"UPDATE image_cache SET size_big=0, size_mini=0, image_data=NULL, image_data_mini=NULL;\" 2>/dev/null", lp_db);
+            (void)system(sql_cmd);
+        }
+    }
 }
 
 static void restart_iconservicesagent_if_needed(void) {
@@ -76,7 +88,8 @@ static void restart_iconservicesagent_if_needed(void) {
     snprintf(cmd, sizeof(cmd),
         "/usr/bin/killall -9 iconservicesagent 2>/dev/null; "
         "/bin/launchctl kickstart -k gui/%d/com.apple.iconservices.iconservicesagent 2>/dev/null; "
-        "/usr/bin/killall Finder 2>/dev/null", (int)uid);
+        "/usr/bin/killall Finder 2>/dev/null; "
+        "/usr/bin/killall Dock 2>/dev/null", (int)uid);
     (void)system(cmd);
 }
 
