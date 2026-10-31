@@ -822,10 +822,86 @@ static void dv_installSwiftUISolariumCompatibilityAllowedFix(void) {
     }
 }
 
+// Spotlight (`Siri AI.app` / `com.apple.campo` and `Spotlight.app` / `com.apple.Spotlight`)
+// links SpotlightUIShared.framework, where `SearchResults.sectionsDescription.getter`
+// (and its companion result-section formatter) calls `[result inlineCard]` followed by
+// `[inlineCard cardSections]`, force-unwrapping `result.inlineCard!` (`cbz x0, <brk #0x1>`)
+// even though `cardSections` is checked via optional chaining (`cbz xB, <continue_loop>`)
+// 8 instructions later. When classic non-Solarium results return `inlineCard == nil`,
+// Spotlight immediately traps with EXC_BREAKPOINT (SIGTRAP). Redirect the `inlineCard == nil`
+// branch to the same loop-continuation target as `cardSections == nil`.
+static void dv_installSpotlightSearchResultsCrashFix(void) {
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if (![bid isEqualToString:@"com.apple.campo"] && ![bid isEqualToString:@"com.apple.Spotlight"]) {
+        return;
+    }
+
+    const struct mach_header_64 *suis_hdr = NULL;
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "/SpotlightUIShared.framework/Versions/A/SpotlightUIShared")) {
+            suis_hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            break;
+        }
+    }
+    if (!suis_hdr) return;
+
+    unsigned long text_size = 0;
+    const uint32_t *text = (const uint32_t *)getsectiondata(suis_hdr, "__TEXT", "__text", &text_size);
+    if (!text || text_size < 64) return;
+
+    NSMutableDictionary<NSNumber *, NSData *> *patches = dv_inlinePatchMap();
+    size_t n_insns = text_size / 4;
+    for (size_t k = 0; k + 12 < n_insns; k++) {
+        // Match:
+        //   k+0: bl <objc_msgSend$inlineCard>
+        //   k+1: mov x29, x29 (0xaa1d03fd, ARC autoreleaseRV marker)
+        //   k+2: bl _objc_retainAutoreleasedReturnValue
+        //   k+3: cbz x0, <brk #0x1>
+        //   ...
+        //   k+5: bl <objc_msgSend$cardSections>
+        //   k+6: mov x29, x29 (0xaa1d03fd)
+        //   ...
+        //   k+11: cbz xB, <continue_loop>
+        if (text[k + 1] != 0xaa1d03fd || text[k + 6] != 0xaa1d03fd) continue;
+        if ((text[k] >> 26) != 0x25 || (text[k + 2] >> 26) != 0x25 || (text[k + 5] >> 26) != 0x25) continue;
+
+        uint32_t cbz_inline = text[k + 3];
+        uint32_t cbz_card = text[k + 11];
+        if ((cbz_inline & 0xff00001f) != 0xb4000000) continue; // cbz x0, ...
+        if ((cbz_card & 0xff000000) != 0xb4000000) continue;   // cbz xB, ...
+
+        int32_t imm_inline = ((int32_t)(cbz_inline << 8)) >> 13;
+        int64_t brk_idx = (int64_t)(k + 3) + imm_inline;
+        if (brk_idx < 0 || (size_t)brk_idx >= n_insns) continue;
+        if (text[brk_idx] != 0xd4200020) continue; // brk #0x1
+
+        int32_t imm_card = ((int32_t)(cbz_card << 8)) >> 13;
+        int32_t new_imm = imm_card + 8; // k+11 + imm_card == (k+3) + (imm_card + 8)
+        uint32_t new_insn = 0xb4000000 | (((uint32_t)new_imm & 0x7ffff) << 5);
+
+        uintptr_t patch_addr = (uintptr_t)&text[k + 3];
+        NSNumber *key = @(patch_addr);
+        if (!patches[key]) {
+            patches[key] = [NSData dataWithBytes:(const void *)patch_addr length:4];
+        }
+
+        vm_address_t page = patch_addr & ~0x3fffULL;
+        kern_return_t kr = vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (kr == KERN_SUCCESS) {
+            *(uint32_t *)patch_addr = new_insn;
+            vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+            sys_icache_invalidate((void *)patch_addr, 4);
+        }
+    }
+}
+
 static void dv_installClassicAppKit(void) {
     dv_installDynamicFeatureInterposeIfNeeded();
     dv_syncSolariumInMemoryCaches(YES);
     dv_installSwiftUISolariumCompatibilityAllowedFix();
+    dv_installSpotlightSearchResultsCrashFix();
     Class cls = NSClassFromString(@"_NSSwiftUICoreFeatureFlags");
     if (cls) {
         dv_swizzleClassMethod(cls, @selector(isSolariumEnabled), (IMP)dv_returnNo, NULL);
