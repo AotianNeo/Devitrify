@@ -520,6 +520,168 @@ static void dv_installClassicAppKit(void) {
     }
 }
 
+#pragma mark - Login / Lock Screen Clock Formatting Fix (Solarium Disabled Fallback)
+
+static void (*dv_orig_bigtime_viewDidLoad)(id self, SEL _cmd) = NULL;
+static void (*dv_orig_bigtime_updateTimeFormatter)(id self, SEL _cmd) = NULL;
+static void (*dv_orig_bigtime_setClockSettings)(id self, SEL _cmd, id settings) = NULL;
+
+static NSLocale *dv_effectiveLocaleForClock(NSLocale *baseLocale, BOOL shows24, NSString *numberingSystem) {
+    if (!baseLocale) baseLocale = [NSLocale currentLocale];
+    NSString *ident = baseLocale.localeIdentifier ?: @"en_US";
+    NSString *hourCycle = shows24 ? @"hours=h23" : @"hours=h12";
+    
+    NSMutableString *newIdent = [ident mutableCopy];
+    if ([newIdent containsString:@"hours="]) {
+        NSRange r = [newIdent rangeOfString:@"hours=h[0-9]+" options:NSRegularExpressionSearch];
+        if (r.location != NSNotFound) {
+            [newIdent replaceCharactersInRange:r withString:hourCycle];
+        }
+    } else {
+        if (![newIdent containsString:@"@"]) {
+            [newIdent appendFormat:@"@%@", hourCycle];
+        } else {
+            [newIdent appendFormat:@";%@", hourCycle];
+        }
+    }
+    
+    if (numberingSystem && numberingSystem.length > 0) {
+        if ([newIdent containsString:@"numbers="]) {
+            NSRange r = [newIdent rangeOfString:@"numbers=[a-zA-Z0-9_-]+" options:NSRegularExpressionSearch];
+            if (r.location != NSNotFound) {
+                [newIdent replaceCharactersInRange:r withString:[NSString stringWithFormat:@"numbers=%@", numberingSystem]];
+            }
+        } else {
+            [newIdent appendFormat:@";numbers=%@", numberingSystem];
+        }
+    }
+    
+    return [NSLocale localeWithLocaleIdentifier:newIdent];
+}
+
+static void dv_swizzled_bigtime_viewDidLoad(id self, SEL _cmd) {
+    if (dv_orig_bigtime_viewDidLoad) {
+        dv_orig_bigtime_viewDidLoad(self, _cmd);
+    }
+    
+    // In macOS with Solarium disabled, LUI2BigTimeViewController's viewDidLoad omits
+    // initializing self->_clockSettings in the classic/fallback branch, leaving it nil.
+    id settings = [self valueForKey:@"_clockSettings"];
+    if (!settings) {
+        Class mgrCls = NSClassFromString(@"LUIClockSettingsManager");
+        if (mgrCls) {
+            id mgr = ((id (*)(id, SEL))objc_msgSend)(mgrCls, NSSelectorFromString(@"sharedClockSettingsManager"));
+            if (mgr) {
+                settings = ((id (*)(id, SEL))objc_msgSend)(mgr, NSSelectorFromString(@"defaultClockSettings"));
+                if (settings) {
+                    [self setValue:settings forKey:@"_clockSettings"];
+                }
+            }
+        }
+    }
+    
+    SEL updFmtSel = NSSelectorFromString(@"_updateTimeFormatter");
+    if ([self respondsToSelector:updFmtSel]) {
+        ((void (*)(id, SEL))objc_msgSend)(self, updFmtSel);
+    }
+    SEL updTimeSel = NSSelectorFromString(@"_updateTime");
+    if ([self respondsToSelector:updTimeSel]) {
+        ((void (*)(id, SEL))objc_msgSend)(self, updTimeSel);
+    }
+}
+
+static void dv_swizzled_bigtime_updateTimeFormatter(id self, SEL _cmd) {
+    (void)_cmd;
+    id settings = [self valueForKey:@"_clockSettings"];
+    if (!settings) {
+        Class mgrCls = NSClassFromString(@"LUIClockSettingsManager");
+        if (mgrCls) {
+            id mgr = ((id (*)(id, SEL))objc_msgSend)(mgrCls, NSSelectorFromString(@"sharedClockSettingsManager"));
+            if (mgr) {
+                settings = ((id (*)(id, SEL))objc_msgSend)(mgr, NSSelectorFromString(@"defaultClockSettings"));
+                if (settings) {
+                    [self setValue:settings forKey:@"_clockSettings"];
+                }
+            }
+        }
+    }
+    
+    BOOL shows24 = NO;
+    if (settings && [settings respondsToSelector:NSSelectorFromString(@"shows24HourTime")]) {
+        shows24 = ((BOOL (*)(id, SEL))objc_msgSend)(settings, NSSelectorFromString(@"shows24HourTime"));
+    } else {
+        CFPropertyListRef pref = CFPreferencesCopyAppValue(CFSTR("AppleICUForce24HourTime"), kCFPreferencesAnyApplication);
+        if (pref) {
+            if (CFGetTypeID(pref) == CFBooleanGetTypeID()) {
+                shows24 = CFBooleanGetValue((CFBooleanRef)pref);
+            } else if (CFGetTypeID(pref) == CFNumberGetTypeID()) {
+                int val = 0;
+                CFNumberGetValue((CFNumberRef)pref, kCFNumberIntType, &val);
+                shows24 = (val != 0);
+            }
+            CFRelease(pref);
+        }
+    }
+    
+    NSString *numbering = nil;
+    if (settings && [settings respondsToSelector:NSSelectorFromString(@"numberingSystem")]) {
+        numbering = ((NSString * (*)(id, SEL))objc_msgSend)(settings, NSSelectorFromString(@"numberingSystem"));
+    }
+    
+    NSDateFormatter *formatter = [self valueForKey:@"_formatter"];
+    if (!formatter) {
+        formatter = [[NSDateFormatter alloc] init];
+        [self setValue:formatter forKey:@"_formatter"];
+    }
+    
+    NSLocale *effLocale = dv_effectiveLocaleForClock([NSLocale currentLocale], shows24, numbering);
+    formatter.locale = effLocale;
+    
+    // In ICU/LDML, 'j' template specifies hour with day period (forcing 'h:mm a', e.g. "1:45 PM"),
+    // whereas 'J' specifies preferred hour cycle without day period, and 'HHmm' guarantees 24-hour.
+    // Lock screen big clock must never display AM/PM.
+    [formatter setLocalizedDateFormatFromTemplate:(shows24 ? @"HHmm" : @"Jmm")];
+}
+
+static void dv_swizzled_bigtime_setClockSettings(id self, SEL _cmd, id settings) {
+    if (dv_orig_bigtime_setClockSettings) {
+        dv_orig_bigtime_setClockSettings(self, _cmd, settings);
+    }
+    SEL updFmtSel = NSSelectorFromString(@"_updateTimeFormatter");
+    if ([self respondsToSelector:updFmtSel]) {
+        ((void (*)(id, SEL))objc_msgSend)(self, updFmtSel);
+    }
+    SEL updTimeSel = NSSelectorFromString(@"_updateTime");
+    if ([self respondsToSelector:updTimeSel]) {
+        ((void (*)(id, SEL))objc_msgSend)(self, updTimeSel);
+    }
+}
+
+static void dv_installLoginClockFix(void) {
+    Class bigCls = NSClassFromString(@"LUI2BigTimeViewController");
+    if (!bigCls) return;
+
+    dv_swizzle(bigCls, NSSelectorFromString(@"viewDidLoad"), (IMP)dv_swizzled_bigtime_viewDidLoad, (IMP *)&dv_orig_bigtime_viewDidLoad);
+    dv_swizzle(bigCls, NSSelectorFromString(@"_updateTimeFormatter"), (IMP)dv_swizzled_bigtime_updateTimeFormatter, (IMP *)&dv_orig_bigtime_updateTimeFormatter);
+    dv_swizzle(bigCls, NSSelectorFromString(@"setClockSettings:"), (IMP)dv_swizzled_bigtime_setClockSettings, (IMP *)&dv_orig_bigtime_setClockSettings);
+}
+
+static void dv_loginUIKitImageCallback(const struct mach_header *mh, intptr_t slide) {
+    (void)slide;
+    Dl_info info;
+    if (dladdr(mh, &info) && info.dli_fname) {
+        if (strstr(info.dli_fname, "LoginUIKit")) {
+            if (NSClassFromString(@"LUI2BigTimeViewController")) {
+                dv_installLoginClockFix();
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    dv_installLoginClockFix();
+                });
+            }
+        }
+    }
+}
+
 #pragma mark - Live State Refresh on Hot-Reload
 
 static void dv_refreshLayersRecursively(CALayer *layer, BOOL hooksActive) {
@@ -715,6 +877,11 @@ static void DevitrifyInit(void) {
             dv_installSplitViewTitlebarAlignmentFix();
             dv_installClassicAppKit();
             dv_installClassicMenuEnforcement();
+            dv_installLoginClockFix();
+            static dispatch_once_t s_lui_once;
+            dispatch_once(&s_lui_once, ^{
+                _dyld_register_func_for_add_image(dv_loginUIKitImageCallback);
+            });
 
             if (NSApp) {
                 dv_refreshLiveWindows(YES);
