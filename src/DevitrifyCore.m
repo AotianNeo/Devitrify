@@ -10,6 +10,7 @@
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
+#import <sys/sysctl.h>
 #if __has_feature(ptrauth_calls)
 #import <ptrauth.h>
 #endif
@@ -22,6 +23,19 @@
 #define DEVITRIFY_CORE_PATH     DEVITRIFY_INSTALL_DIR @"/DevitrifyCore.dylib"
 
 static volatile int s_core_hooks_disabled = 0;
+
+static BOOL dv_isSafeBoot(void) {
+    int val = 0;
+    size_t sz = sizeof(val);
+    if (sysctlbyname("kern.safeboot", &val, &sz, NULL, 0) == 0) {
+        return val != 0;
+    }
+    return NO;
+}
+
+static inline Class dv_hostClass(void) {
+    return objc_getClass("NSApplication") ?: (objc_getClass("NSProcessInfo") ?: objc_getClass("NSObject"));
+}
 
 static void dv_setLoaderSystemDisabled(BOOL disabled) {
     s_core_hooks_disabled = disabled ? 1 : 0;
@@ -60,10 +74,10 @@ static void dv_markProcessBypassedOnDisk(int sig) {
 
 #pragma mark - Idempotent Swizzle & Inline Patch Registry
 
-// Process-wide map of original IMPs stored on [NSApplication class] so hot-reloads
+// Process-wide map of original IMPs stored on dv_hostClass() so hot-reloads
 // never chain swizzles or lose the original implementation, and can restore all hooks on demand.
 static NSMutableDictionary<NSString *, NSValue *> *dv_originalIMPMap(void) {
-    Class host = [NSApplication class];
+    Class host = dv_hostClass();
     const void *key = (const void *)sel_registerName("dv_originalIMPMap");
     NSMutableDictionary *map = objc_getAssociatedObject(host, key);
     if (!map) {
@@ -74,7 +88,7 @@ static NSMutableDictionary<NSString *, NSValue *> *dv_originalIMPMap(void) {
 }
 
 static NSMutableDictionary<NSNumber *, NSData *> *dv_inlinePatchMap(void) {
-    Class host = [NSApplication class];
+    Class host = dv_hostClass();
     const void *key = (const void *)sel_registerName("dv_inlinePatchMap");
     NSMutableDictionary *map = objc_getAssociatedObject(host, key);
     if (!map) {
@@ -85,7 +99,7 @@ static NSMutableDictionary<NSNumber *, NSData *> *dv_inlinePatchMap(void) {
 }
 
 static NSMutableDictionary<NSNumber *, NSValue *> *dv_dynamicInterposeSlotMap(void) {
-    Class host = [NSApplication class];
+    Class host = dv_hostClass();
     const void *key = (const void *)sel_registerName("dv_dynamicInterposeSlotMap");
     NSMutableDictionary *map = objc_getAssociatedObject(host, key);
     if (!map) {
@@ -311,7 +325,7 @@ static uint64_t dv_decodeAdrpAdd(const uint32_t *insns, uint32_t reg) {
 }
 
 static NSArray<NSValue *> *dv_appKitMenuGlassCachePointers(void) {
-    Class host = [NSApplication class];
+    Class host = dv_hostClass();
     const void *assocKey = (const void *)sel_registerName("dv_appKitMenuGlassCachePointers");
     NSArray<NSValue *> *cached = objc_getAssociatedObject(host, assocKey);
     if (cached) return cached;
@@ -355,7 +369,7 @@ static void dv_setAppKitMenuGlassCache(uint8_t val) {
         if (p) __atomic_store_n(p, val, __ATOMIC_RELEASE);
     }
     const void *flexKey = (const void *)sel_registerName("dv_appKitFlexiglassCachePointers");
-    NSArray<NSValue *> *flexPtrs = objc_getAssociatedObject([NSApplication class], flexKey);
+    NSArray<NSValue *> *flexPtrs = objc_getAssociatedObject(dv_hostClass(), flexKey);
     uint8_t flexVal = (val == 2) ? 3 : 0; // 3 = true for NSEnableFlexiglass when Devitrify is active
     for (NSValue *v in flexPtrs) {
         uint8_t *p = (uint8_t *)v.pointerValue;
@@ -983,8 +997,124 @@ static void dv_performHotReload(void) {
     });
 }
 
+#pragma mark - macOS 26 Icon Jail Neutralization
+
+static BOOL swizzled_iconStack_returnNo(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return NO;
+}
+
+static IMP s_orig_resourceWithBundleURL = NULL;
+static id swizzled_resourceWithBundleURL(id self, SEL _cmd, NSURL *url, NSDictionary *dict, NSUInteger options) {
+    // Clear bit 8 (0x8) which forces iconStackResourcesAllowed wrapping
+    options &= ~(NSUInteger)8;
+    if (s_orig_resourceWithBundleURL) {
+        return ((id(*)(id, SEL, NSURL *, NSDictionary *, NSUInteger))s_orig_resourceWithBundleURL)(self, _cmd, url, dict, options);
+    }
+    return nil;
+}
+
+static IMP s_orig_assetCatalogResource = NULL;
+static id swizzled_assetCatalogResource(id self, SEL _cmd, NSURL *url, NSString *name, NSUInteger platform, BOOL isAppLike, NSError **error) {
+    // platform == 1 is macOS AppKit / standard app; disabling isAppLike prevents ISMultisizedAppAssetCatalogResource jail wrapping
+    if (platform == 1) {
+        isAppLike = NO;
+    }
+    if (s_orig_assetCatalogResource) {
+        return ((id(*)(id, SEL, NSURL *, NSString *, NSUInteger, BOOL, NSError **))s_orig_assetCatalogResource)(self, _cmd, url, name, platform, isAppLike, error);
+    }
+    return nil;
+}
+
+static IMP s_orig_composite_imageForSize_scale = NULL;
+static id swizzled_composite_imageForSize_scale(id self, SEL _cmd, CGSize size, CGFloat scale) {
+    SEL wrapSel = sel_registerName("wrappedResource");
+    if ([self respondsToSelector:wrapSel]) {
+        id wrapped = ((id(*)(id, SEL))objc_msgSend)(self, wrapSel);
+        if (wrapped && [wrapped respondsToSelector:_cmd]) {
+            return ((id(*)(id, SEL, CGSize, CGFloat))objc_msgSend)(wrapped, _cmd, size, scale);
+        }
+    }
+    if (s_orig_composite_imageForSize_scale) {
+        return ((id(*)(id, SEL, CGSize, CGFloat))s_orig_composite_imageForSize_scale)(self, _cmd, size, scale);
+    }
+    return nil;
+}
+
+static IMP s_orig_multisizedApp_imageForSize_scale = NULL;
+static id swizzled_multisizedApp_imageForSize_scale(id self, SEL _cmd, CGSize size, CGFloat scale) {
+    SEL lookupSel = sel_registerName("_lookupForSize:scale:");
+    if ([self respondsToSelector:lookupSel]) {
+        id cuiImg = ((id(*)(id, SEL, CGSize, CGFloat))objc_msgSend)(self, lookupSel, size, scale);
+        if (cuiImg && [cuiImg respondsToSelector:sel_registerName("image")]) {
+            CGImageRef cgImg = ((CGImageRef(*)(id, SEL))objc_msgSend)(cuiImg, sel_registerName("image"));
+            CGFloat imgScale = scale;
+            if ([cuiImg respondsToSelector:sel_registerName("scale")]) {
+                CGFloat s = ((CGFloat(*)(id, SEL))objc_msgSend)(cuiImg, sel_registerName("scale"));
+                if (s > 0.0) imgScale = s;
+            }
+            if (cgImg) {
+                Class isImgClass = objc_getClass("ISImage");
+                if (isImgClass) {
+                    id isImg = ((id(*)(id, SEL))objc_msgSend)(isImgClass, sel_registerName("alloc"));
+                    return ((id(*)(id, SEL, CGImageRef, CGFloat))objc_msgSend)(isImg, sel_registerName("initWithCGImage:scale:"), cgImg, imgScale);
+                }
+            }
+        }
+    }
+    if (s_orig_multisizedApp_imageForSize_scale) {
+        return ((id(*)(id, SEL, CGSize, CGFloat))s_orig_multisizedApp_imageForSize_scale)(self, _cmd, size, scale);
+    }
+    return nil;
+}
+
+static void dv_installIconJailNeutralization(void) {
+    if (objc_getClass("ISRecordResourceProvider") == Nil) {
+        dlopen("/System/Library/PrivateFrameworks/IconServices.framework/Versions/A/IconServices", RTLD_LAZY | RTLD_GLOBAL);
+    }
+    if (objc_getClass("IFDefaults") == Nil) {
+        dlopen("/System/Library/PrivateFrameworks/IconFoundation.framework/Versions/A/IconFoundation", RTLD_LAZY | RTLD_GLOBAL);
+    }
+
+    Class clsDefaults = objc_getClass("ISDefaults");
+    if (clsDefaults) {
+        dv_swizzle(clsDefaults, sel_registerName("iconStackAppIconsAllowed"), (IMP)swizzled_iconStack_returnNo, NULL);
+    }
+
+    Class clsIFDefaults = objc_getClass("IFDefaults");
+    if (clsIFDefaults) {
+        dv_swizzle(clsIFDefaults, sel_registerName("iconStackAppIconsAllowed"), (IMP)swizzled_iconStack_returnNo, NULL);
+    }
+
+    Class clsRecordProvider = objc_getClass("ISRecordResourceProvider");
+    if (clsRecordProvider) {
+        dv_swizzle(clsRecordProvider, sel_registerName("iconStackResourcesAllowed"), (IMP)swizzled_iconStack_returnNo, NULL);
+    }
+
+    Class clsResourceProvider = objc_getClass("ISResourceProvider");
+    if (clsResourceProvider) {
+        dv_swizzleClassMethod(clsResourceProvider, sel_registerName("resourceWithBundleURL:iconDictionary:options:"), (IMP)swizzled_resourceWithBundleURL, &s_orig_resourceWithBundleURL);
+    }
+
+    Class clsAssetCatalog = objc_getClass("ISAssetCatalogResource");
+    if (clsAssetCatalog) {
+        dv_swizzleClassMethod(clsAssetCatalog, sel_registerName("assetCatalogResourceWithURL:imageName:platform:isAppLike:error:"), (IMP)swizzled_assetCatalogResource, &s_orig_assetCatalogResource);
+    }
+
+    Class clsComposite = objc_getClass("ISIconStackCompositeResource");
+    if (clsComposite) {
+        dv_swizzle(clsComposite, sel_registerName("imageForSize:scale:"), (IMP)swizzled_composite_imageForSize_scale, &s_orig_composite_imageForSize_scale);
+    }
+
+    Class clsMultisized = objc_getClass("ISMultisizedAppAssetCatalogResource");
+    if (clsMultisized) {
+        dv_swizzle(clsMultisized, sel_registerName("imageForSize:scale:"), (IMP)swizzled_multisizedApp_imageForSize_scale, &s_orig_multisizedApp_imageForSize_scale);
+    }
+}
+
 static void dv_installHotReloadListenerIfNeeded(void) {
-    Class host = [NSApplication class];
+    Class host = dv_hostClass();
+    if (!host) return;
     const void *key = (const void *)sel_registerName("dv_installHotReloadListenerIfNeeded");
     if (objc_getAssociatedObject(host, key)) return;
     objc_setAssociatedObject(host, key, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1002,26 +1132,35 @@ static void dv_runInitOnMainThread(void) {
     @autoreleasepool {
         dv_installHotReloadListenerIfNeeded();
 
-        BOOL sysDisabled = dv_isSystemDisabledOnDisk();
+        BOOL isSafeBoot = dv_isSafeBoot();
+        BOOL sysDisabled = isSafeBoot || dv_isSystemDisabledOnDisk();
         BOOL procBypassed = dv_isProcessBypassedOnDisk();
         dv_setLoaderSystemDisabled(sysDisabled || procBypassed);
 
+        BOOL hasAppKit = (objc_getClass("NSApplication") != Nil);
+
         if (sysDisabled || procBypassed) {
             dv_restoreAllSwizzlesAndPatches();
-            dv_setAppKitMenuGlassCache(0);
-            if (NSApp) {
-                dv_refreshLiveWindows(NO);
+            if (hasAppKit) {
+                dv_setAppKitMenuGlassCache(0);
+                if (NSApp) {
+                    dv_refreshLiveWindows(NO);
+                }
             }
             return;
         }
 
         dv_runFaultTolerant(^{
-            dv_installGlassFilterNeutralization();
-            dv_installSplitViewTitlebarAlignmentFix();
-            dv_installClassicAppKit();
-            dv_installClassicMenuEnforcement();
+            if (hasAppKit) {
+                dv_installGlassFilterNeutralization();
+                dv_installSplitViewTitlebarAlignmentFix();
+                dv_installClassicAppKit();
+                dv_installClassicMenuEnforcement();
+            }
 
-            if (NSApp) {
+            dv_installIconJailNeutralization();
+
+            if (hasAppKit && NSApp) {
                 dv_refreshLiveWindows(YES);
             }
         });

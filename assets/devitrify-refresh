@@ -5,6 +5,13 @@
 
 INSTALL_DIR=/Users/Shared/.devitrify
 
+# Safe Mode auto-disable check
+if [ "$(/usr/sbin/sysctl -n kern.safeboot 2>/dev/null)" = "1" ]; then
+    /bin/launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null || true
+    echo "[Devitrify Refresh] ⚠️ System booted in Safe Mode (kern.safeboot=1). Devitrify is automatically disabled."
+    exit 0
+fi
+
 if [ "$1" = "-n" ] || [ "$1" = "--status" ] || [ "$1" = "status" ]; then
     exec "$INSTALL_DIR/devitrify-reload" --status
 fi

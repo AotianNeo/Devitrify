@@ -14,6 +14,11 @@ if [ "$macos_version" -lt 26 ] || [ "$macos_version" -gt 27 ]; then
     exit 1
 fi
 
+if [ "$(/usr/sbin/sysctl -n kern.safeboot 2>/dev/null)" = "1" ]; then
+    echo "macOS is currently running in Safe Mode. Devitrify is disabled."
+    exit 0
+fi
+
 if [ -f "$INSTALL_DIR/DevitrifyCore.dylib" ]; then
     printf "It appears that you have installed Devitrify + Launchpad.\n"
     read -r -p "Do you want to uninstall it and restore system defaults? [Y/n] " response </dev/tty || exit 1

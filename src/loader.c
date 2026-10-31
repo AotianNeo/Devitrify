@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #define DEVITRIFY_INSTALL_DIR "/Users/Shared/.devitrify"
@@ -21,8 +22,18 @@
 #define DEVITRIFY_BYPASS_DIR DEVITRIFY_INSTALL_DIR "/crash-bypass"
 
 static int s_appkit_loaded = 0;
+static int s_iconservices_loaded = 0;
 static volatile int s_system_disabled = 0;
 static volatile int s_process_bypassed = 0;
+
+static int is_safe_boot(void) {
+    int val = 0;
+    size_t sz = sizeof(val);
+    if (sysctlbyname("kern.safeboot", &val, &sz, NULL, 0) == 0) {
+        return val != 0;
+    }
+    return 0;
+}
 
 const char *devitrify_process_bypass_marker_path(void) {
     static char s_marker[PATH_MAX];
@@ -54,6 +65,10 @@ const char *devitrify_process_bypass_marker_path(void) {
 }
 
 static void check_disable_and_bypass_state(void) {
+    if (is_safe_boot()) {
+        s_system_disabled = 1;
+        return;
+    }
     s_system_disabled = (access(DEVITRIFY_DISABLED_FILE, F_OK) == 0) ? 1 : 0;
     const char *marker = devitrify_process_bypass_marker_path();
     if (marker && access(marker, F_OK) == 0) {
@@ -69,9 +84,14 @@ static void detect_loaded_frameworks(void) {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "/AppKit.framework/")) {
-            s_appkit_loaded = 1;
-            break;
+        if (name) {
+            if (strstr(name, "/AppKit.framework/")) {
+                s_appkit_loaded = 1;
+            }
+            if (strstr(name, "/IconServices.framework/")) {
+                s_iconservices_loaded = 1;
+            }
+            if (s_appkit_loaded && s_iconservices_loaded) break;
         }
     }
 }
@@ -221,7 +241,8 @@ static void devitrify_load_core(void) {
     *slash = '\0';
     detect_loaded_frameworks();
 
-    if (!s_appkit_loaded) return;
+    if (is_safe_boot()) return;
+    if (!s_appkit_loaded && !s_iconservices_loaded) return;
 
     // Even if s_system_disabled is currently 1, we still load DevitrifyCore so the process
     // registers the hot-reload listener and can be re-enabled live via `devitrify-reload --enable`.

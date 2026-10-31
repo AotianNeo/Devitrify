@@ -8,6 +8,12 @@
 
 INSTALL_DIR=/Users/Shared/.devitrify
 
+# Safe Mode auto-disable check
+if [ "$(/usr/sbin/sysctl -n kern.safeboot 2>/dev/null)" = "1" ]; then
+    /bin/launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null || true
+    exit 0
+fi
+
 /bin/launchctl setenv DYLD_INSERT_LIBRARIES "$INSTALL_DIR/libDevitrify.dylib"
 
 if [ -x "$INSTALL_DIR/devitrify-menubar" ]; then

@@ -26,6 +26,15 @@
 #define BYPASS_DIR INSTALL_DIR "/crash-bypass"
 #define NOTIFY_NAME "com.aotianneo.devitrify.reload"
 
+static int is_safe_boot(void) {
+    int val = 0;
+    size_t sz = sizeof(val);
+    if (sysctlbyname("kern.safeboot", &val, &sz, NULL, 0) == 0) {
+        return val != 0;
+    }
+    return 0;
+}
+
 static void ensure_directories(void) {
     mkdir(INSTALL_DIR, 0755);
     mkdir(RELOAD_DIR, 0755);
@@ -38,8 +47,36 @@ static void move_to_trash_or_unlink(const char *src, const char *filename) {
         char dst[1024];
         snprintf(dst, sizeof(dst), "%s/.Trash/%s.%lld", home, filename, (long long)time(NULL));
         if (rename(src, dst) == 0) return;
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd), "/bin/mv -f \"%s\" \"%s\" 2>/dev/null", src, dst);
+        if (system(cmd) == 0) return;
     }
     unlink(src);
+}
+
+static void purge_icon_cache_to_trash(void) {
+    char cache_dir[PATH_MAX];
+    if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache_dir, sizeof(cache_dir)) > 0) {
+        const char *targets[] = { "com.apple.iconservices", "com.apple.iconservicesagent", NULL };
+        for (int i = 0; targets[i]; i++) {
+            char p[PATH_MAX];
+            snprintf(p, sizeof(p), "%s%s", cache_dir, targets[i]);
+            if (access(p, F_OK) == 0) {
+                char trash_name[256];
+                snprintf(trash_name, sizeof(trash_name), "%s.%lld", targets[i], (long long)time(NULL));
+                move_to_trash_or_unlink(p, trash_name);
+            }
+        }
+    }
+}
+
+static void restart_iconservicesagent_if_needed(void) {
+    pid_t uid = getuid();
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        "/usr/bin/killall -9 iconservicesagent 2>/dev/null; "
+        "/bin/launchctl kickstart -k gui/%d/com.apple.iconservices.iconservicesagent 2>/dev/null", (int)uid);
+    (void)system(cmd);
 }
 
 static void clean_old_reloads(const char *keep_name) {
@@ -385,6 +422,13 @@ static void print_status(void) {
 }
 
 int main(int argc, char **argv) {
+    if (is_safe_boot()) {
+        printf("[Devitrify Hot-Reload] ⚠️ System booted in Safe Mode (kern.safeboot=1). Devitrify is automatically disabled.\n");
+        (void)system("/bin/launchctl unsetenv DYLD_INSERT_LIBRARIES");
+        notify_post(NOTIFY_NAME);
+        return 0;
+    }
+
     ensure_directories();
 
     int mode_disable = 0;
@@ -411,6 +455,8 @@ int main(int argc, char **argv) {
             close(fd);
         }
         printf("[Devitrify Hot-Reload] 🛑 System-wide disable marker set (%s).\n", DISABLED_FILE);
+        purge_icon_cache_to_trash();
+        restart_iconservicesagent_if_needed();
     } else if (mode_enable) {
         if (access(DISABLED_FILE, F_OK) == 0) {
             move_to_trash_or_unlink(DISABLED_FILE, "devitrify-disabled");
@@ -468,6 +514,8 @@ int main(int argc, char **argv) {
     if (!is_currently_disabled) {
         int injected = 0, uninjected = 0;
         scan_or_inject_running_apps(new_dylib_path, 1, &injected, &uninjected);
+        purge_icon_cache_to_trash();
+        restart_iconservicesagent_if_needed();
     }
 
     // Ensure AppleICUForce24HourTime is enabled in global preferences so loginwindow's
