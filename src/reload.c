@@ -157,6 +157,21 @@ int main(int argc, char **argv) {
     printf("[Devitrify Hot-Reload] Broadcasting notify '%s'...\n", NOTIFY_NAME);
     notify_post(NOTIFY_NAME);
 
+    // Ensure AppleICUForce24HourTime is enabled in global preferences so loginwindow's
+    // LUIClockSettingsMonitor sets shows24HourTime to true in ClockSettings.plist, causing
+    // LUI2BigTimeViewController to select the 'Jmm' template instead of 'jmm' (which forcibly
+    // displays unwanted AM/PM markers on the lock screen).
+    CFPropertyListRef curVal = CFPreferencesCopyAppValue(CFSTR("AppleICUForce24HourTime"), kCFPreferencesAnyApplication);
+    Boolean needsSet = true;
+    if (curVal && CFGetTypeID(curVal) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)curVal)) {
+        needsSet = false;
+    }
+    if (curVal) CFRelease(curVal);
+    if (needsSet) {
+        CFPreferencesSetAppValue(CFSTR("AppleICUForce24HourTime"), kCFBooleanTrue, kCFPreferencesAnyApplication);
+        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+    }
+
     // Also broadcast distributed time/number preference notifications so long-running
     // system daemons (including loginwindow's LUIClockSettingsMonitor) resynchronize
     // and refresh lock-screen clock formatting immediately without restarting loginwindow.

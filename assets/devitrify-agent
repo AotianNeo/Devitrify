@@ -46,6 +46,14 @@ if [ -x "$INSTALL_DIR/Dock.app/Contents/MacOS/Dock" ]; then
     /bin/launchctl start com.apple.Dock.agent
 fi
 
+# Ensure loginwindow suppresses unwanted AM/PM markers on the lock screen clock
+if [ "$(/usr/bin/defaults read -g AppleICUForce24HourTime 2>/dev/null)" != "1" ]; then
+    /usr/bin/defaults write -g AppleICUForce24HourTime -bool true
+fi
+if [ -x "$INSTALL_DIR/devitrify-reload" ]; then
+    "$INSTALL_DIR/devitrify-reload" >/dev/null 2>&1
+fi
+
 /bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.controlcenter"
 /bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.notificationcenterui.agent"
 /bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.campo" 2>/dev/null || true
