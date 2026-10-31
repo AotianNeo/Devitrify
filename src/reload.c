@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 #define INSTALL_DIR "/Users/Shared/.devitrify"
 #define RELOAD_DIR INSTALL_DIR "/reload"
@@ -155,6 +156,15 @@ int main(int argc, char **argv) {
 
     printf("[Devitrify Hot-Reload] Broadcasting notify '%s'...\n", NOTIFY_NAME);
     notify_post(NOTIFY_NAME);
+
+    // Also broadcast distributed time/number preference notifications so long-running
+    // system daemons (including loginwindow's LUIClockSettingsMonitor) resynchronize
+    // and refresh lock-screen clock formatting immediately without restarting loginwindow.
+    CFNotificationCenterRef dist = CFNotificationCenterGetDistributedCenter();
+    if (dist) {
+        CFNotificationCenterPostNotification(dist, CFSTR("AppleTimePreferencesChangedNotification"), NULL, NULL, true);
+        CFNotificationCenterPostNotification(dist, CFSTR("AppleNumberPreferencesChangedNotification"), NULL, NULL, true);
+    }
 
     if (is_currently_disabled) {
         printf("[Devitrify Hot-Reload] ✅ All Devitrify hooks unhooked and disabled system-wide across running apps!\n");
