@@ -14,9 +14,7 @@ With Liquid Glass disabled system-wide, Devitrify keeps all system and third-par
 ~/Downloads/Devitrify-main/devitrify
 ```
 
-5. When the script lists apps that were already running, let it quit and reopen them so they load Devitrify
-
-Tested on macOS Golden Gate 27.2. The installer checks the required AMFI boot arguments, offers to add them if missing, builds Devitrify and the Launchpad shims from source, installs the unified runtime into /Users/Shared/.devitrify, deploys Launchpad into /Applications/Launchpad.app, and registers a single login agent that activates everything at login.
+Tested on macOS Golden Gate 27.2. The installer checks the required AMFI boot arguments, offers to add them if missing, builds Devitrify and the Launchpad shims from source, installs the unified runtime into /Users/Shared/.devitrify, deploys Launchpad into /Applications/Launchpad.app, registers a single login agent, and live-injects Devitrify into all already-running GUI apps and system UI services without restarting them.
 
 To uninstall and restore the default system Dock and settings, run the installer script again, then log out and back in.
 
@@ -58,7 +56,7 @@ make reload
 ```
 
 ## How It Works
-- **Process Loader & SwiftUI Compatibility Mode**: The lightweight loader library is injected via DYLD_INSERT_LIBRARIES and only loads DevitrifyCore into GUI processes that link AppKit, leaving command-line tools untouched. At image load time, it interposes SwiftUICore feature flag and SDK checks so Solarium evaluates to compatibility mode: explicit glass views (such as Calculator buttons, Control Center, Notification Center, and the ⌘⇧5 Screenshot bar) retain their frosted glass backdrop layers while SwiftUI and AppKit toolbars, split views, buttons, and menus stay 100% classic.
+- **Process Loader & Zero-Restart Live Injection**: The lightweight loader library is injected via DYLD_INSERT_LIBRARIES and only loads DevitrifyCore into GUI processes that link AppKit, leaving command-line tools untouched. For apps and system UI agents that were already running at login or install time before DYLD_INSERT_LIBRARIES took effect, the reload tool scans running processes via Mach dyld image inspection and live-injects DevitrifyCore directly into them using PAC-compatible Mach remote threads—requiring zero app or service restarts. Inside live-injected processes, DevitrifyCore unlocks hardware TPRO to perform dynamic GOT interposing on SwiftUICore feature flag and SDK checks and synchronizes already-evaluated Solarium and AppKit memory caches in place.
 - **Spotlight (Siri AI) In-Process Recovery**: For processes linking SpotlightUIInternal, DevitrifyCore patches the SwiftUICore AllowedInCompatibilityKey getter in memory so Spotlight's search bar and results panel render their frosted glass background without enabling new-style SwiftUI controls in other apps.
 - **QuartzCore Refraction & Rim Neutralization**: DevitrifyCore intercepts CAFilter and CASDFKeyFillHighlightEffect so glassBackground and glassForeground filters have their refraction, bleed, chromatic aberration, and specular highlight amounts zeroed out, leaving a clean Gaussian blur with native drop shadows intact.
 - **Dynamic AppKit Classic Menus**: DevitrifyCore enforces classic AppKit popup menus and dynamically locates AppKit's in-memory glass menu configuration cache bytes via ARM64 instruction decoding—supporting instant live switching on hot-reload with zero hardcoded addresses.

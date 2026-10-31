@@ -3,7 +3,8 @@
 # 1. Applies the 33pt Solarium menu bar height in WindowServer and sets DYLD_INSERT_LIBRARIES.
 # 2. Restores /Applications/Launchpad.app if deleted by a macOS update and launches the
 #    Launchpad-capable Dock with DynamicDesktop & WindowManager shims.
-# 3. Relaunches Control Center, Notification Center, Spotlight (Siri AI / campo), and Rectangle.
+# 3. Live-injects DevitrifyCore.dylib into any apps or system UI agents that started before
+#    DYLD_INSERT_LIBRARIES took effect, without restarting them.
 
 INSTALL_DIR=/Users/Shared/.devitrify
 
@@ -54,11 +55,3 @@ if [ -x "$INSTALL_DIR/devitrify-reload" ]; then
     "$INSTALL_DIR/devitrify-reload" >/dev/null 2>&1
 fi
 
-/bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.controlcenter"
-/bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.notificationcenterui.agent"
-/bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.campo" 2>/dev/null || true
-/bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.apple.Spotlight" 2>/dev/null || true
-/bin/launchctl kill SIGTERM "gui/$(/usr/bin/id -u)/com.apple.screencaptureui.agent" 2>/dev/null || true
-if /usr/bin/pgrep -x Rectangle >/dev/null 2>&1; then
-    /usr/bin/killall Rectangle >/dev/null 2>&1 && /usr/bin/open -g -a Rectangle
-fi

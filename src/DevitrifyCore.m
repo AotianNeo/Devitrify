@@ -21,7 +21,10 @@
 #define DEVITRIFY_CURRENT_PATH  DEVITRIFY_INSTALL_DIR @"/reload/current"
 #define DEVITRIFY_CORE_PATH     DEVITRIFY_INSTALL_DIR @"/DevitrifyCore.dylib"
 
+static volatile int s_core_hooks_disabled = 0;
+
 static void dv_setLoaderSystemDisabled(BOOL disabled) {
+    s_core_hooks_disabled = disabled ? 1 : 0;
     void (*fn)(int) = dlsym(RTLD_DEFAULT, "devitrify_set_system_disabled");
     if (fn) fn(disabled ? 1 : 0);
 }
@@ -33,7 +36,10 @@ static BOOL dv_isSystemDisabledOnDisk(void) {
 static NSString *dv_processBypassMarkerPath(void) {
     const char *(*fn)(void) = dlsym(RTLD_DEFAULT, "devitrify_process_bypass_marker_path");
     const char *cpath = fn ? fn() : NULL;
-    return cpath ? [NSString stringWithUTF8String:cpath] : nil;
+    if (cpath) return [NSString stringWithUTF8String:cpath];
+    NSString *exe = [NSBundle.mainBundle.executablePath lastPathComponent] ?: NSProcessInfo.processInfo.processName;
+    if (!exe.length) return nil;
+    return [NSString stringWithFormat:@"%@/%@.bypass", DEVITRIFY_BYPASS_DIR, exe];
 }
 
 static BOOL dv_isProcessBypassedOnDisk(void) {
@@ -76,6 +82,150 @@ static NSMutableDictionary<NSNumber *, NSData *> *dv_inlinePatchMap(void) {
         objc_setAssociatedObject(host, key, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return map;
+}
+
+static NSMutableDictionary<NSNumber *, NSValue *> *dv_dynamicInterposeSlotMap(void) {
+    Class host = [NSApplication class];
+    const void *key = (const void *)sel_registerName("dv_dynamicInterposeSlotMap");
+    NSMutableDictionary *map = objc_getAssociatedObject(host, key);
+    if (!map) {
+        map = [NSMutableDictionary dictionary];
+        objc_setAssociatedObject(host, key, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return map;
+}
+
+#pragma mark - Hardware TPRO Unlock & Dynamic Interpose (for Live-Injected Processes)
+
+struct dv_dyld_interpose_tuple {
+    const void *replacement;
+    const void *replacee;
+};
+
+static inline void dv_tproMakeWritable(void) {
+#if defined(__arm64__)
+    uint8_t mode = *(volatile uint8_t *)0xfffffc10cULL;
+    if (mode == 2 || mode == 3) {
+        uint64_t val = *(volatile uint64_t *)0xfffffc0d0ULL;
+        __asm__ volatile("dmb ishst\n\tmsr S3_6_C15_C1_5, %0\n\tisb" :: "r"(val) : "memory");
+    }
+#endif
+}
+
+static inline void dv_tproMakeReadonly(void) {
+#if defined(__arm64__)
+    uint8_t mode = *(volatile uint8_t *)0xfffffc10cULL;
+    if (mode == 2 || mode == 3) {
+        uint64_t val = *(volatile uint64_t *)0xfffffc0d8ULL;
+        __asm__ volatile("dmb ishst\n\tmsr S3_6_C15_C1_5, %0\n\tisb" :: "r"(val) : "memory");
+    }
+#endif
+}
+
+static inline uintptr_t dv_stripFnPtr(const void *ptr) {
+    if (!ptr) return 0;
+#if __has_feature(ptrauth_calls)
+    return (uintptr_t)ptrauth_strip((void *)ptr, ptrauth_key_function_pointer) & 0x00007fffffffffffULL;
+#else
+    return (uintptr_t)ptr & 0x00007fffffffffffULL;
+#endif
+}
+
+static inline void *dv_signAuthGotSlot(const void *replacement, void **slot) {
+#if __has_feature(ptrauth_calls)
+    void *raw = ptrauth_strip((void *)replacement, ptrauth_key_function_pointer);
+    return ptrauth_sign_unauthenticated(raw, ptrauth_key_asia, slot);
+#else
+    (void)slot;
+    return (void *)replacement;
+#endif
+}
+
+static uint64_t dv_decodeAdrpAdd(const uint32_t *insns, uint32_t reg);
+
+static void dv_writeGotSlot(void **slot, void *newSignedVal, BOOL isAuthGot) {
+    if (!slot) return;
+    NSMutableDictionary<NSNumber *, NSValue *> *slotMap = dv_dynamicInterposeSlotMap();
+    NSNumber *slotKey = @((uintptr_t)slot);
+    if (!slotMap[slotKey]) {
+        slotMap[slotKey] = [NSValue valueWithPointer:*slot];
+    }
+
+    if (isAuthGot) {
+        dv_tproMakeWritable();
+        *slot = newSignedVal;
+        dv_tproMakeReadonly();
+    } else {
+        vm_address_t page = ((vm_address_t)slot) & ~0x3fffULL;
+        if (vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
+            *slot = newSignedVal;
+        } else {
+            dv_tproMakeWritable();
+            *slot = newSignedVal;
+            dv_tproMakeReadonly();
+        }
+    }
+}
+
+static void dv_dyld_dynamic_interpose(const struct mach_header *mh_raw, const struct dv_dyld_interpose_tuple array[], size_t count) {
+    if (!mh_raw || !array || count == 0) return;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)mh_raw;
+    NSMutableDictionary<NSNumber *, NSValue *> *slotMap = dv_dynamicInterposeSlotMap();
+
+    unsigned long text_sz = 0;
+    const uint32_t *code = (const uint32_t *)getsectiondata(mh, "__TEXT", "__text", &text_sz);
+    if (code && text_sz >= 4) {
+        size_t n = text_sz / 4;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t insn = code[i];
+            if ((insn & 0x7c000000) != 0x14000000) continue;
+            int32_t imm26 = (int32_t)(insn & 0x03ffffff);
+            if (imm26 & 0x02000000) imm26 |= 0xfc000000;
+            uintptr_t stub_addr = (uintptr_t)&code[i] + ((intptr_t)imm26 * 4);
+            if (stub_addr < 0x180000000ULL || stub_addr >= 0x300000000ULL) continue;
+            const uint32_t *stub = (const uint32_t *)stub_addr;
+            if (stub[2] != 0xf9400230 || stub[3] != 0xd71f0a11) continue;
+            uint64_t slot_addr = dv_decodeAdrpAdd(stub, 17);
+            if (!slot_addr) continue;
+
+            void **slot = (void **)slot_addr;
+            NSValue *savedOrig = slotMap[@(slot_addr)];
+            uintptr_t cur_raw = dv_stripFnPtr(savedOrig ? savedOrig.pointerValue : *slot);
+
+            for (size_t k = 0; k < count; k++) {
+                uintptr_t target_raw = dv_stripFnPtr(array[k].replacee);
+                if (target_raw && cur_raw == target_raw) {
+                    dv_writeGotSlot(slot, dv_signAuthGotSlot(array[k].replacement, slot), YES);
+                    break;
+                }
+            }
+        }
+    }
+
+    const char *segs[]  = { "__AUTH_CONST", "__DATA_CONST", "__DATA", "__AUTH" };
+    const char *sects[] = { "__auth_got",   "__got",        "__la_symbol_ptr", "__nl_symbol_ptr" };
+    for (size_t s = 0; s < 4; s++) {
+        for (size_t t = 0; t < 4; t++) {
+            unsigned long sz = 0;
+            void **got = (void **)getsectiondata(mh, segs[s], sects[t], &sz);
+            if (!got || sz < sizeof(void *)) continue;
+            BOOL isAuth = (strcmp(sects[t], "__auth_got") == 0);
+            size_t cnt = sz / sizeof(void *);
+            for (size_t j = 0; j < cnt; j++) {
+                void **slot = &got[j];
+                NSValue *savedOrig = slotMap[@((uintptr_t)slot)];
+                uintptr_t cur_raw = dv_stripFnPtr(savedOrig ? savedOrig.pointerValue : *slot);
+                for (size_t k = 0; k < count; k++) {
+                    uintptr_t target_raw = dv_stripFnPtr(array[k].replacee);
+                    if (target_raw && cur_raw == target_raw) {
+                        void *newVal = isAuth ? dv_signAuthGotSlot(array[k].replacement, slot) : (void *)array[k].replacement;
+                        dv_writeGotSlot(slot, newVal, isAuth);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 static void dv_swizzleMethod(Class cls, SEL sel, IMP newImp, IMP *outOrig, BOOL isClassMethod) {
@@ -135,6 +285,16 @@ static void dv_restoreAllSwizzlesAndPatches(void) {
             sys_icache_invalidate((void *)addr, origBytes.length);
         }
     }
+
+    NSMutableDictionary<NSNumber *, NSValue *> *slots = dv_dynamicInterposeSlotMap();
+    for (NSNumber *slotNum in [slots allKeys]) {
+        void **slot = (void **)slotNum.unsignedLongLongValue;
+        void *origSignedPtr = slots[slotNum].pointerValue;
+        if (!slot || !origSignedPtr) continue;
+        dv_tproMakeWritable();
+        *slot = origSignedPtr;
+        dv_tproMakeReadonly();
+    }
 }
 
 #pragma mark - Classic menu enforcement
@@ -157,6 +317,7 @@ static NSArray<NSValue *> *dv_appKitMenuGlassCachePointers(void) {
     if (cached) return cached;
 
     NSMutableSet<NSValue *> *ptrs = [NSMutableSet set];
+    NSMutableSet<NSValue *> *flexPtrs = [NSMutableSet set];
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *name = _dyld_get_image_name(i);
         if (!name || !strstr(name, "/AppKit.framework/Versions/C/AppKit")) continue;
@@ -175,12 +336,16 @@ static NSArray<NSValue *> *dv_appKitMenuGlassCachePointers(void) {
             NSString *s = (__bridge NSString *)(const void *)cf_addr;
             if ([s hasPrefix:@"NSGlassMenu"] || [s isEqualToString:@"NSMenuUseGlassWindowStyle"]) {
                 [ptrs addObject:[NSValue valueWithPointer:(const void *)cache_addr]];
+            } else if ([s isEqualToString:@"NSEnableFlexiglass"]) {
+                [flexPtrs addObject:[NSValue valueWithPointer:(const void *)cache_addr]];
             }
         }
         break;
     }
     cached = [ptrs allObjects];
     objc_setAssociatedObject(host, assocKey, cached, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    const void *flexKey = (const void *)sel_registerName("dv_appKitFlexiglassCachePointers");
+    objc_setAssociatedObject(host, flexKey, [flexPtrs allObjects], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return cached;
 }
 
@@ -188,6 +353,13 @@ static void dv_setAppKitMenuGlassCache(uint8_t val) {
     for (NSValue *v in dv_appKitMenuGlassCachePointers()) {
         uint8_t *p = (uint8_t *)v.pointerValue;
         if (p) __atomic_store_n(p, val, __ATOMIC_RELEASE);
+    }
+    const void *flexKey = (const void *)sel_registerName("dv_appKitFlexiglassCachePointers");
+    NSArray<NSValue *> *flexPtrs = objc_getAssociatedObject([NSApplication class], flexKey);
+    uint8_t flexVal = (val == 2) ? 3 : 0; // 3 = true for NSEnableFlexiglass when Devitrify is active
+    for (NSValue *v in flexPtrs) {
+        uint8_t *p = (uint8_t *)v.pointerValue;
+        if (p) __atomic_store_n(p, flexVal, __ATOMIC_RELEASE);
     }
 }
 
@@ -415,6 +587,138 @@ static void dv_installGlassFilterNeutralization(void) {
 
 #pragma mark - Liquid Glass apps: classic AppKit controls
 
+extern bool _os_feature_enabled_impl(const char *domain, const char *feature);
+typedef struct { uint32_t platform; uint32_t version; } dv_build_version;
+extern bool dyld_program_sdk_at_least(dv_build_version version);
+
+static volatile int s_core_in_solarium_compute_values = 0;
+
+static bool dv_core_caller_is_swift_feature_flags(const void *address) {
+    Dl_info info;
+    if (!dladdr(address, &info) || !info.dli_fname) return false;
+    return strstr(info.dli_fname, "/SwiftUICore.framework/") != NULL ||
+           strstr(info.dli_fname, "FeatureFlags") != NULL;
+}
+
+static bool dv_core_feature_enabled(const char *domain, const char *feature) {
+    if (s_core_hooks_disabled) {
+        return _os_feature_enabled_impl(domain, feature);
+    }
+    if (domain && feature) {
+        if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "flexiGlassMacOS")) return true;
+        if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) {
+            if (dv_core_caller_is_swift_feature_flags(__builtin_return_address(0))) {
+                s_core_in_solarium_compute_values = 1;
+                return true;
+            }
+        }
+    }
+    return _os_feature_enabled_impl(domain, feature);
+}
+
+static bool dv_core_version_after_compat(dv_build_version version) {
+    uint32_t limit = (version.platform == 0xFFFFFFFFU) ? 0x07E8FFFFU : 0x000F0000U;
+    return version.version > limit;
+}
+
+static bool dv_core_caller_draws_interface(const void *address) {
+    Dl_info info;
+    if (!dladdr(address, &info) || !info.dli_fname) return false;
+    return strstr(info.dli_fname, "/AppKit.framework/") || strstr(info.dli_fname, "/SwiftUI.framework/") ||
+           strstr(info.dli_fname, "/SwiftUICore.framework/");
+}
+
+static bool dv_core_program_sdk_at_least(dv_build_version version) {
+    if (s_core_hooks_disabled) {
+        return dyld_program_sdk_at_least(version);
+    }
+    if (s_core_in_solarium_compute_values && dv_core_version_after_compat(version) &&
+        dv_core_caller_draws_interface(__builtin_return_address(0))) {
+        s_core_in_solarium_compute_values = 0;
+        return false;
+    }
+    return dyld_program_sdk_at_least(version);
+}
+
+static void dv_installDynamicFeatureInterposeIfNeeded(void) {
+    if (dlsym(RTLD_DEFAULT, "devitrify_set_system_disabled") != NULL) {
+        return; // Already interposed at launch by libDevitrify.dylib
+    }
+    struct dv_dyld_interpose_tuple tuples[] = {
+        { (const void *)dv_core_feature_enabled, (const void *)_os_feature_enabled_impl },
+        { (const void *)dv_core_program_sdk_at_least, (const void *)dyld_program_sdk_at_least },
+    };
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        if (strstr(name, "/AppKit.framework/") ||
+            strstr(name, "/SwiftUICore.framework/") ||
+            strstr(name, "/SwiftUI.framework/") ||
+            strstr(name, "/UIKitCore.framework/") ||
+            strstr(name, "FeatureFlags")) {
+            dv_dyld_dynamic_interpose(_dyld_get_image_header(i), tuples, 2);
+        }
+    }
+}
+
+static void dv_syncAppKitSolariumFuncCache(const char *symName, uint8_t val) {
+    void *sym = dlsym(RTLD_DEFAULT, symName);
+    uintptr_t addr = dv_stripFnPtr(sym);
+    if (!addr) return;
+    const uint32_t *insns = (const uint32_t *)addr;
+    // Expect at +16: adrp x8, page; ldrb w0, [x8, #imm12]
+    uint32_t i0 = insns[4], i1 = insns[5];
+    if ((i0 & 0x9f00001f) != (0x90000000 | 8)) return;
+    if ((i1 & 0xffc003e0) != (0x39400000 | (8 << 5))) return;
+    int64_t immlo = (i0 >> 29) & 0x3;
+    int64_t immhi = (int64_t)((int32_t)(i0 << 8) >> 13);
+    int64_t page_off = ((immhi << 2) | immlo) << 12;
+    uint64_t pc_page = ((uint64_t)&insns[4]) & ~0xfffULL;
+    uint8_t *cache_byte = (uint8_t *)((uint64_t)((int64_t)pc_page + page_off) + ((i1 >> 10) & 0xfff));
+    if (cache_byte) {
+        __atomic_store_n(cache_byte, val, __ATOMIC_RELEASE);
+    }
+}
+
+static void dv_syncSolariumInMemoryCaches(BOOL hooksActive) {
+    if (hooksActive) {
+        dv_syncAppKitSolariumFuncCache("NSSolariumEnabled", 0);
+        dv_syncAppKitSolariumFuncCache("NSSolariumEnabledIgnoringCompatibility", 0);
+    }
+
+    void *h = dlopen("/System/Library/Frameworks/SwiftUICore.framework/Versions/A/SwiftUICore", RTLD_NOLOAD | RTLD_LAZY);
+    if (!h) return;
+    void *eval_sym = dlsym(h, "$s7SwiftUI8SolariumV8evaluate6inputsSbAA12_GraphInputsV_tFZ");
+    uintptr_t eval_addr = dv_stripFnPtr(eval_sym);
+    if (!eval_addr) return;
+
+    uint32_t b_insn = *(uint32_t *)eval_addr;
+    if ((b_insn & 0xfc000000) != 0x14000000) return;
+    int32_t imm26 = (int32_t)(b_insn & 0x03ffffff);
+    if (imm26 & 0x02000000) imm26 |= 0xfc000000;
+    uintptr_t target = eval_addr + ((intptr_t)imm26 * 4);
+
+    uint64_t cached_values_addr = dv_decodeAdrpAdd((const uint32_t *)(target + 0x68), 22);
+    uint64_t once_token_addr = dv_decodeAdrpAdd((const uint32_t *)(target + 0xec), 0);
+    if (!cached_values_addr || !once_token_addr) return;
+
+    intptr_t once_val = *(volatile intptr_t *)once_token_addr;
+    if (once_val == -1) {
+        uintptr_t storage = *(uintptr_t *)(cached_values_addr + 8);
+        if (storage > 0x100000000ULL) {
+            uint64_t count = *(uint64_t *)(storage + 0x10);
+            for (uint64_t i = 0; i < count && i < 16; i++) {
+                uint8_t *entry = (uint8_t *)(storage + 0x20 + i * 16);
+                if (hooksActive) {
+                    entry[1] = 1; // .compatibility
+                    *(uint64_t *)(entry + 8) = 5;
+                }
+            }
+        }
+    }
+}
+
 static BOOL dv_returnNo(id self, SEL _cmd) {
     (void)self; (void)_cmd;
     return NO;
@@ -504,6 +808,8 @@ static void dv_installSwiftUISolariumCompatibilityAllowedFix(void) {
 }
 
 static void dv_installClassicAppKit(void) {
+    dv_installDynamicFeatureInterposeIfNeeded();
+    dv_syncSolariumInMemoryCaches(YES);
     dv_installSwiftUISolariumCompatibilityAllowedFix();
     Class cls = NSClassFromString(@"_NSSwiftUICoreFeatureFlags");
     if (cls) {
@@ -692,8 +998,7 @@ static void dv_installHotReloadListenerIfNeeded(void) {
 
 #pragma mark - Constructor
 
-__attribute__((constructor))
-static void DevitrifyInit(void) {
+static void dv_runInitOnMainThread(void) {
     @autoreleasepool {
         dv_installHotReloadListenerIfNeeded();
 
@@ -721,4 +1026,15 @@ static void DevitrifyInit(void) {
             }
         });
     }
+}
+
+__attribute__((constructor))
+static void DevitrifyInit(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            dv_runInitOnMainThread();
+        });
+        return;
+    }
+    dv_runInitOnMainThread();
 }

@@ -22,6 +22,9 @@ if [ -f "$INSTALL_DIR/DevitrifyCore.dylib" ]; then
             printf "Reinstalling Devitrify + Launchpad...\n"
             ;;
         *)
+            if [ -x "$INSTALL_DIR/devitrify-reload" ]; then
+                "$INSTALL_DIR/devitrify-reload" --disable > /dev/null 2>&1
+            fi
             if [ -x "$INSTALL_DIR/devitrify-menubar" ]; then
                 "$INSTALL_DIR/devitrify-menubar" --restore > /dev/null 2>&1
             fi
@@ -60,10 +63,6 @@ if [ -f "$INSTALL_DIR/DevitrifyCore.dylib" ]; then
 </dict>
 </plist>
 EOF
-            launchctl kickstart -k "gui/$(id -u)/com.apple.controlcenter"
-            launchctl kickstart -k "gui/$(id -u)/com.apple.notificationcenterui.agent"
-            launchctl kickstart -k "gui/$(id -u)/com.apple.campo" 2>/dev/null || true
-            launchctl kickstart -k "gui/$(id -u)/com.apple.Spotlight" 2>/dev/null || true
             printf "Devitrify + Launchpad have been uninstalled. Log out and back in to finish.\n"
             exit 0
             ;;

@@ -32,7 +32,7 @@ build/devitrify-menubar: src/menubar.c
 
 build/devitrify-reload: src/reload.c assets/debugger.entitlements
 	mkdir -p build
-	$(CC) $(CFLAGS) -framework CoreFoundation $< -o $@
+	$(CC) $(CFLAGS) -x objective-c -fobjc-arc -framework Cocoa $< -o $@
 	$(SIGN_DEBUG) $@
 
 build/DynamicDesktop.framework/Versions/A/DynamicDesktop: src/DynamicDesktop-shim.c

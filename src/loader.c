@@ -200,6 +200,15 @@ static void safe_dlopen_core(const char *dylib_path) {
 
 __attribute__((constructor))
 static void devitrify_load_core(void) {
+    const char *sb_tok = getenv("DEVITRIFY_SANDBOX_TOKEN");
+    if (sb_tok && sb_tok[0]) {
+        int64_t (*fn_consume)(const char *) =
+            (int64_t (*)(const char *))dlsym(RTLD_DEFAULT, "sandbox_extension_consume");
+        if (fn_consume) {
+            (void)fn_consume(sb_tok);
+        }
+    }
+
     check_disable_and_bypass_state();
     if (s_process_bypassed) return;
 
