@@ -55,9 +55,10 @@ static void move_to_trash_or_unlink(const char *src, const char *filename) {
 }
 
 static void purge_icon_cache_to_trash(void) {
+    (void)system("/usr/bin/killall -9 DockHelper Launchpad 2>/dev/null");
     char cache_dir[PATH_MAX];
     if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache_dir, sizeof(cache_dir)) > 0) {
-        const char *targets[] = { "com.apple.iconservices", "com.apple.iconservicesagent", "com.apple.dock.iconcache", NULL };
+        const char *targets[] = { "com.apple.iconservices", "com.apple.iconservicesagent", NULL };
         for (int i = 0; targets[i]; i++) {
             char p[PATH_MAX];
             snprintf(p, sizeof(p), "%s%s", cache_dir, targets[i]);
@@ -72,25 +73,44 @@ static void purge_icon_cache_to_trash(void) {
     char user_dir[PATH_MAX];
     if (confstr(_CS_DARWIN_USER_DIR, user_dir, sizeof(user_dir)) > 0) {
         char lp_db[PATH_MAX];
-        snprintf(lp_db, sizeof(lp_db), "%s0/com.apple.dock.launchpad/db/db", user_dir);
+        snprintf(lp_db, sizeof(lp_db), "%scom.apple.dock.launchpad/db/db", user_dir);
+        if (access(lp_db, F_OK) != 0) {
+            snprintf(lp_db, sizeof(lp_db), "%s0/com.apple.dock.launchpad/db/db", user_dir);
+        }
         if (access(lp_db, F_OK) == 0) {
-            char sql_cmd[PATH_MAX + 128];
+            char sql_cmd[PATH_MAX + 256];
             snprintf(sql_cmd, sizeof(sql_cmd),
-                "/usr/bin/sqlite3 \"%s\" \"UPDATE image_cache SET size_big=0, size_mini=0, image_data=NULL, image_data_mini=NULL;\" 2>/dev/null", lp_db);
+                "/usr/bin/sqlite3 \"%s\" \"PRAGMA wal_checkpoint(TRUNCATE); UPDATE image_cache SET size_big=0, size_mini=0, image_data=NULL, image_data_mini=NULL; PRAGMA wal_checkpoint(TRUNCATE);\" 2>/dev/null", lp_db);
             (void)system(sql_cmd);
         }
     }
 }
 
-static void restart_iconservicesagent_if_needed(void) {
-    pid_t uid = getuid();
+static void restart_iconservicesagent_only(void) {
     char cmd[512];
+    uid_t uid = getuid();
     snprintf(cmd, sizeof(cmd),
-        "/usr/bin/killall -9 iconservicesagent 2>/dev/null; "
-        "/bin/launchctl kickstart -k gui/%d/com.apple.iconservices.iconservicesagent 2>/dev/null; "
-        "/usr/bin/killall Finder 2>/dev/null; "
-        "/usr/bin/killall Dock 2>/dev/null", (int)uid);
+        "/bin/launchctl bootout gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null; "
+        "/bin/launchctl bootstrap gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null",
+        (unsigned)uid, (unsigned)uid);
     (void)system(cmd);
+}
+
+static void restart_iconservicesagent_if_needed(void) {
+    restart_iconservicesagent_only();
+
+    char cache_dir[PATH_MAX];
+    if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache_dir, sizeof(cache_dir)) > 0) {
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%scom.apple.dock.iconcache", cache_dir);
+        if (access(p, F_OK) == 0) {
+            char trash_name[256];
+            snprintf(trash_name, sizeof(trash_name), "com.apple.dock.iconcache.%lld", (long long)time(NULL));
+            move_to_trash_or_unlink(p, trash_name);
+        }
+    }
+
+    (void)system("/usr/bin/killall Finder 2>/dev/null; /usr/bin/killall Dock 2>/dev/null");
 }
 
 static void clean_old_reloads(const char *keep_name) {
@@ -447,6 +467,7 @@ int main(int argc, char **argv) {
 
     int mode_disable = 0;
     int mode_enable = 0;
+    int mode_login = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--status") || !strcmp(argv[i], "status")) {
@@ -458,6 +479,8 @@ int main(int argc, char **argv) {
             mode_disable = 1;
         } else if (!strcmp(argv[i], "--enable") || !strcmp(argv[i], "enable") || !strcmp(argv[i], "on")) {
             mode_enable = 1;
+        } else if (!strcmp(argv[i], "--login") || !strcmp(argv[i], "login")) {
+            mode_login = 1;
         }
     }
 
@@ -528,33 +551,37 @@ int main(int argc, char **argv) {
     if (!is_currently_disabled) {
         int injected = 0, uninjected = 0;
         scan_or_inject_running_apps(new_dylib_path, 1, &injected, &uninjected);
-        purge_icon_cache_to_trash();
-        restart_iconservicesagent_if_needed();
+        if (mode_login) {
+            restart_iconservicesagent_only();
+        } else {
+            purge_icon_cache_to_trash();
+            restart_iconservicesagent_if_needed();
+        }
     }
 
-    // Ensure AppleICUForce24HourTime is enabled in global preferences so loginwindow's
-    // LUIClockSettingsMonitor sets shows24HourTime to true in ClockSettings.plist, causing
-    // LUI2BigTimeViewController to select the 'Jmm' template instead of 'jmm' (which forcibly
-    // displays unwanted AM/PM markers on the lock screen).
-    CFPropertyListRef curVal = CFPreferencesCopyAppValue(CFSTR("AppleICUForce24HourTime"), kCFPreferencesAnyApplication);
-    Boolean needsSet = true;
-    if (curVal && CFGetTypeID(curVal) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)curVal)) {
-        needsSet = false;
-    }
-    if (curVal) CFRelease(curVal);
-    if (needsSet) {
-        CFPreferencesSetAppValue(CFSTR("AppleICUForce24HourTime"), kCFBooleanTrue, kCFPreferencesAnyApplication);
-        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
-    }
-
-    // Also broadcast distributed time/number preference notifications so long-running
-    // system daemons (including loginwindow's LUIClockSettingsMonitor) resynchronize
-    // and refresh lock-screen clock formatting immediately without restarting loginwindow.
+    // Pulse AppleICUForce24HourTime across AppleTimePreferencesChangedNotification so
+    // loginwindow's CFLocaleCopyCurrent() and LUIClockSettingsMonitor cache 24-hour
+    // lock-screen clock formatting (suppressing unwanted AM/PM markers on the lock screen),
+    // then immediately clear AppleICUForce24HourTime without posting a second global time
+    // notification and refresh com.apple.menuextra.clock so ControlCenter's top-right
+    // menu bar clock stays in 12-hour AM/PM mode.
+    CFPreferencesSetAppValue(CFSTR("AppleICUForce24HourTime"), kCFBooleanTrue, kCFPreferencesAnyApplication);
+    CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
     CFNotificationCenterRef dist = CFNotificationCenterGetDistributedCenter();
     if (dist) {
         CFNotificationCenterPostNotification(dist, CFSTR("AppleTimePreferencesChangedNotification"), NULL, NULL, true);
         CFNotificationCenterPostNotification(dist, CFSTR("AppleNumberPreferencesChangedNotification"), NULL, NULL, true);
     }
+    usleep(120000);
+    CFPreferencesSetAppValue(CFSTR("AppleICUForce24HourTime"), NULL, kCFPreferencesAnyApplication);
+    CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+
+    Boolean flashSep = CFPreferencesGetAppBooleanValue(CFSTR("FlashDateSeparators"), CFSTR("com.apple.menuextra.clock"), NULL);
+    CFPreferencesSetAppValue(CFSTR("FlashDateSeparators"), flashSep ? kCFBooleanFalse : kCFBooleanTrue, CFSTR("com.apple.menuextra.clock"));
+    CFPreferencesAppSynchronize(CFSTR("com.apple.menuextra.clock"));
+    usleep(50000);
+    CFPreferencesSetAppValue(CFSTR("FlashDateSeparators"), flashSep ? kCFBooleanTrue : kCFBooleanFalse, CFSTR("com.apple.menuextra.clock"));
+    CFPreferencesAppSynchronize(CFSTR("com.apple.menuextra.clock"));
 
     if (is_currently_disabled) {
         printf("[Devitrify Hot-Reload] ✅ All Devitrify hooks unhooked and disabled system-wide across running apps!\n");

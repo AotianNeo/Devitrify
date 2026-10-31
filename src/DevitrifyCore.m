@@ -1007,7 +1007,7 @@ static BOOL swizzled_iconStack_returnNo(id self, SEL _cmd) {
 
 static IMP s_orig_cgimage_with_data = NULL;
 static CGImageRef swizzled_CGImageWithData_iconIndexInfo(id self, SEL _cmd, NSData *data, void *iconIndexInfo) {
-    if (data.length >= 8) {
+    if (!s_core_hooks_disabled && data.length >= 8) {
         const uint8_t *bytes = (const uint8_t *)data.bytes;
         // If data is modern compressed image format (PNG, JPEG 2000, JPEG, etc.),
         // decode via ImageIO rather than letting legacy QuickDraw table treat compressed bytes as raw pixels.
@@ -1019,7 +1019,7 @@ static CGImageRef swizzled_CGImageWithData_iconIndexInfo(id self, SEL _cmd, NSDa
             if (src) {
                 CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
                 CFRelease(src);
-                if (img) return img;
+                if (img) return (CGImageRef)CFAutorelease(img);
             }
         }
     }
@@ -1029,35 +1029,15 @@ static CGImageRef swizzled_CGImageWithData_iconIndexInfo(id self, SEL _cmd, NSDa
     return NULL;
 }
 
-static IMP s_orig_resourceWithBundleURL = NULL;
-static id swizzled_resourceWithBundleURL(id self, SEL _cmd, NSURL *url, NSDictionary *dict, NSUInteger options) {
-    // Clear bit 8 (0x8) which forces iconStackResourcesAllowed wrapping
-    options &= ~(NSUInteger)8;
-    if (s_orig_resourceWithBundleURL) {
-        return ((id(*)(id, SEL, NSURL *, NSDictionary *, NSUInteger))s_orig_resourceWithBundleURL)(self, _cmd, url, dict, options);
-    }
-    return nil;
-}
-
-static IMP s_orig_assetCatalogResource = NULL;
-static id swizzled_assetCatalogResource(id self, SEL _cmd, NSURL *url, NSString *name, NSUInteger platform, BOOL isAppLike, NSError **error) {
-    // platform == 1 is macOS AppKit / standard app; disabling isAppLike prevents ISMultisizedAppAssetCatalogResource jail wrapping
-    if (platform == 1) {
-        isAppLike = NO;
-    }
-    if (s_orig_assetCatalogResource) {
-        return ((id(*)(id, SEL, NSURL *, NSString *, NSUInteger, BOOL, NSError **))s_orig_assetCatalogResource)(self, _cmd, url, name, platform, isAppLike, error);
-    }
-    return nil;
-}
-
 static IMP s_orig_composite_imageForSize_scale = NULL;
 static id swizzled_composite_imageForSize_scale(id self, SEL _cmd, CGSize size, CGFloat scale) {
-    SEL wrapSel = sel_registerName("wrappedResource");
-    if ([self respondsToSelector:wrapSel]) {
-        id wrapped = ((id(*)(id, SEL))objc_msgSend)(self, wrapSel);
-        if (wrapped && [wrapped respondsToSelector:_cmd]) {
-            return ((id(*)(id, SEL, CGSize, CGFloat))objc_msgSend)(wrapped, _cmd, size, scale);
+    if (!s_core_hooks_disabled) {
+        SEL wrapSel = sel_registerName("wrappedResource");
+        if ([self respondsToSelector:wrapSel]) {
+            id wrapped = ((id(*)(id, SEL))objc_msgSend)(self, wrapSel);
+            if (wrapped && [wrapped respondsToSelector:_cmd]) {
+                return ((id(*)(id, SEL, CGSize, CGFloat))objc_msgSend)(wrapped, _cmd, size, scale);
+            }
         }
     }
     if (s_orig_composite_imageForSize_scale) {
@@ -1066,31 +1046,357 @@ static id swizzled_composite_imageForSize_scale(id self, SEL _cmd, CGSize size, 
     return nil;
 }
 
-static IMP s_orig_multisizedApp_imageForSize_scale = NULL;
-static id swizzled_multisizedApp_imageForSize_scale(id self, SEL _cmd, CGSize size, CGFloat scale) {
-    SEL lookupSel = sel_registerName("_lookupForSize:scale:");
-    if ([self respondsToSelector:lookupSel]) {
-        id cuiImg = ((id(*)(id, SEL, CGSize, CGFloat))objc_msgSend)(self, lookupSel, size, scale);
-        if (cuiImg && [cuiImg respondsToSelector:sel_registerName("image")]) {
-            CGImageRef cgImg = ((CGImageRef(*)(id, SEL))objc_msgSend)(cuiImg, sel_registerName("image"));
-            CGFloat imgScale = scale;
-            if ([cuiImg respondsToSelector:sel_registerName("scale")]) {
-                CGFloat s = ((CGFloat(*)(id, SEL))objc_msgSend)(cuiImg, sel_registerName("scale"));
-                if (s > 0.0) imgScale = s;
+@interface NSObject (DVIconPrivate)
+- (void)setForceClearBackground:(BOOL)force;
+- (id)_lookupForSize:(CGSize)size scale:(double)scale;
+- (CGImageRef)image;
+- (id)initWithCGImage:(CGImageRef)cg scale:(double)scale;
+@end
+
+static const void *kDVStackRefKey      = &kDVStackRefKey;
+static const void *kDVDescRefKey       = &kDVDescRefKey;
+static const void *kDVForceKeepKey     = &kDVForceKeepKey;
+static const void *kDVStackDecisionKey = &kDVStackDecisionKey;
+static const void *kDVStackScaleKey    = &kDVStackScaleKey;
+static const void *kDVStackCenterXKey  = &kDVStackCenterXKey;
+static const void *kDVStackCenterYKey  = &kDVStackCenterYKey;
+
+// Evaluates whether a layered icon rendered without its background plate (0x888ULL)
+// is a complete, centered standalone object (Type A -> strip squircle background & scale up to standard icon size)
+// vs. surface markings/cutouts/edge-anchored layers that require their flat background plate (Type B -> 0x889ULL).
+static BOOL dv_shouldStripLayeredIconCGImage(CGImageRef cg, double *outScale, double *outCx, double *outCy) {
+    if (outScale) *outScale = 1.0;
+    if (outCx)    *outCx    = 0.5;
+    if (outCy)    *outCy    = 0.5;
+    if (!cg) return NO;
+    const int w = 128, h = 128;
+    uint8_t *buf = (uint8_t *)calloc(w * h * 4, 1);
+    if (!buf) return NO;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+    CGContextRelease(ctx);
+
+    long vis = 0, white = 0, dark = 0, colored = 0;
+    double sumX = 0, sumY = 0;
+    int minX = w, maxX = -1, minY = h, maxY = -1;
+    int minX128 = w, maxX128 = -1, minY128 = h, maxY128 = -1;
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            const uint8_t *p = buf + (y * w + x) * 4;
+            uint8_t a = p[3];
+            if (a < 25) continue;
+            vis++;
+            sumX += x;
+            sumY += y;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            if (a >= 128) {
+                if (x < minX128) minX128 = x;
+                if (x > maxX128) maxX128 = x;
+                if (y < minY128) minY128 = y;
+                if (y > maxY128) maxY128 = y;
             }
-            if (cgImg) {
-                Class isImgClass = objc_getClass("ISImage");
-                if (isImgClass) {
-                    id isImg = ((id(*)(id, SEL))objc_msgSend)(isImgClass, sel_registerName("alloc"));
-                    return ((id(*)(id, SEL, CGImageRef, CGFloat))objc_msgSend)(isImg, sel_registerName("initWithCGImage:scale:"), cgImg, imgScale);
+
+            int r = (p[0] * 255) / a;
+            int g = (p[1] * 255) / a;
+            int b = (p[2] * 255) / a;
+            int maxC = MAX(r, MAX(g, b));
+            int minC = MIN(r, MIN(g, b));
+            int sat = maxC - minC;
+            if (sat > 35 && maxC > 50) {
+                colored++;
+            } else if (minC > 200) {
+                white++;
+            } else if (maxC < 75) {
+                dark++;
+            }
+        }
+    }
+    free(buf);
+    if (vis <= 0) return NO;
+
+    double cov = (100.0 * vis) / (double)(w * h);
+    double wht = (100.0 * white) / (double)vis;
+    double drk = (100.0 * dark) / (double)vis;
+    double col = (100.0 * colored) / (double)vis;
+    double cx  = (sumX / vis) / (double)w;
+    double cy  = (sumY / vis) / (double)h;
+    double bw  = (maxX - minX + 1) / (double)w;
+    double bh  = (maxY - minY + 1) / (double)h;
+
+    if (cov < 15.0) return NO;
+    if (wht > 80.0 && col < 15.0) return NO;
+    if (col < 7.0 && (drk > 50.0 || wht < 3.0)) return NO;
+    if (fabs(cx - 0.50) > 0.055 || fabs(cy - 0.50) > 0.055) return NO;
+    if ((bw >= 0.76 || bh >= 0.76) && cov < 58.0) return NO;
+
+    double bw128 = (maxX128 >= minX128) ? ((maxX128 - minX128 + 1) / (double)w) : bw;
+    double bh128 = (maxY128 >= minY128) ? ((maxY128 - minY128 + 1) / (double)h) : bh;
+    double maxDim = MAX(bw128, bh128);
+    double cx128 = (maxX128 >= minX128) ? (((minX128 + maxX128 + 1) * 0.5) / (double)w) : 0.5;
+    double cy128 = (maxY128 >= minY128) ? (((minY128 + maxY128 + 1) * 0.5) / (double)h) : 0.5;
+
+    // Standard macOS squircle icons occupy ~0.8125 of the canvas, whereas foreground-only glyphs
+    // inside layered icons were shrunk to ~0.55-0.65 to fit inside the Liquid Glass squircle jail.
+    // Scale Type A icons up so their foreground visual bounding box reaches ~0.828 of the canvas.
+    double scale = (maxDim > 0.25 && maxDim < 0.80) ? (0.828 / maxDim) : 1.0;
+    if (scale > 1.42) scale = 1.42;
+    if (scale < 1.0)  scale = 1.0;
+
+    if (outScale) *outScale = scale;
+    if (outCx)    *outCx    = cx128;
+    if (outCy)    *outCy    = cy128;
+    return YES;
+}
+
+static CGImageRef dv_scaleTypeACGImage(CGImageRef cg, double scale, double cx, double cy) {
+    if (!cg || scale <= 1.01) return cg;
+    size_t w = CGImageGetWidth(cg);
+    size_t h = CGImageGetHeight(cg);
+    if (w < 8 || h < 8) return cg;
+
+    CGColorSpaceRef cs = CGImageGetColorSpace(cg);
+    CGColorSpaceRef fallbackCS = NULL;
+    if (!cs) {
+        fallbackCS = CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB);
+        cs = fallbackCS;
+    }
+    CGContextRef ctx = CGBitmapContextCreate(
+        NULL, w, h,
+        CGImageGetBitsPerComponent(cg), 0,
+        cs, CGImageGetBitmapInfo(cg));
+    if (!ctx) {
+        if (!fallbackCS) fallbackCS = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
+        ctx = CGBitmapContextCreate(NULL, w, h, 8, w * 4, fallbackCS, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    }
+    if (fallbackCS) CGColorSpaceRelease(fallbackCS);
+    if (!ctx) return cg;
+
+    double drawW = (double)w * scale;
+    double drawH = (double)h * scale;
+    double cgCx  = cx * (double)w;
+    double cgCy  = (1.0 - cy) * (double)h;
+    double originX = (double)w * 0.5 - cgCx * scale;
+    double originY = (double)h * 0.5 - cgCy * scale;
+
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+    CGContextDrawImage(ctx, CGRectMake(originX, originY, drawW, drawH), cg);
+    CGImageRef out = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    if (!out) return cg;
+    return (CGImageRef)CFAutorelease(out);
+}
+
+static BOOL dv_cgImageHasTransparentCorners(CGImageRef cg) {
+    if (!cg) return NO;
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+    if (w < 8 || h < 8) return NO;
+    uint8_t px[16] = {0};
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, 2, 2, 8, 8, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+    CGContextRelease(ctx);
+    return px[3] < 10;
+}
+
+static IMP s_orig_multisized_imageForSize_scale = NULL;
+static id swizzled_multisized_imageForSize_scale(id self, SEL _cmd, CGSize size, double scale) {
+    if (!s_core_hooks_disabled) {
+        SEL lookupSel = sel_registerName("_lookupForSize:scale:");
+        if ([self respondsToSelector:lookupSel]) {
+            id namedImg = ((id (*)(id, SEL, CGSize, double))objc_msgSend)(self, lookupSel, size, scale);
+            if (namedImg && [namedImg respondsToSelector:@selector(image)]) {
+                CGImageRef cg = ((CGImageRef (*)(id, SEL))objc_msgSend)(namedImg, @selector(image));
+                // Pre-shaped macOS icons in Assets.car (transparent corners, e.g. GarageBand, iMovie, Keynote)
+                // should be returned directly without synthetic CUIMutableNamedIconLayerStack wrapping.
+                // Unmasked square iOS icons in Assets.car (opaque corners, e.g. GlobalTrader, Bybit, 东方财富)
+                // fall through to CUIMutableNamedIconLayerStack with 0x889ULL for native squircle masking.
+                if (cg && dv_cgImageHasTransparentCorners(cg)) {
+                    Class clsIFImage = objc_getClass("IFImage");
+                    if (clsIFImage) {
+                        size_t targetW = (size_t)lrint(size.width * scale);
+                        size_t targetH = (size_t)lrint(size.height * scale);
+                        if (targetW > 0 && targetH > 0 && (CGImageGetWidth(cg) != targetW || CGImageGetHeight(cg) != targetH)) {
+                            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                            CGContextRef ctx = CGBitmapContextCreate(NULL, targetW, targetH, 8, targetW * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+                            CGColorSpaceRelease(cs);
+                            CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+                            CGContextDrawImage(ctx, CGRectMake(0, 0, targetW, targetH), cg);
+                            CGImageRef scaled = CGBitmapContextCreateImage(ctx);
+                            CGContextRelease(ctx);
+                            if (scaled) {
+                                id img = [[clsIFImage alloc] initWithCGImage:scaled scale:scale];
+                                CGImageRelease(scaled);
+                                return img;
+                            }
+                        }
+                        return [[clsIFImage alloc] initWithCGImage:cg scale:scale];
+                    }
                 }
             }
         }
     }
-    if (s_orig_multisizedApp_imageForSize_scale) {
-        return ((id(*)(id, SEL, CGSize, CGFloat))s_orig_multisizedApp_imageForSize_scale)(self, _cmd, size, scale);
+    if (s_orig_multisized_imageForSize_scale) {
+        return ((id (*)(id, SEL, CGSize, double))s_orig_multisized_imageForSize_scale)(self, _cmd, size, scale);
     }
     return nil;
+}
+
+static Class s_clsMutableLayerStack = Nil;
+static IMP s_orig_finalizedIconWithDescriptor = NULL;
+static id swizzled_finalizedIconWithDescriptor(id self, SEL _cmd, id desc, NSError **error) {
+    if (s_core_hooks_disabled || !s_orig_finalizedIconWithDescriptor) {
+        return s_orig_finalizedIconWithDescriptor
+            ? ((id(*)(id, SEL, id, NSError **))s_orig_finalizedIconWithDescriptor)(self, _cmd, desc, error)
+            : nil;
+    }
+    if (!s_clsMutableLayerStack) {
+        s_clsMutableLayerStack = objc_getClass("CUIMutableNamedIconLayerStack");
+    }
+    BOOL isSyntheticMutable = (s_clsMutableLayerStack && [self isKindOfClass:s_clsMutableLayerStack]);
+    NSNumber *cachedDecision = objc_getAssociatedObject(self, kDVStackDecisionKey);
+    BOOL shouldClear = YES;
+    if (isSyntheticMutable) {
+        shouldClear = NO;
+    } else if (cachedDecision != nil) {
+        shouldClear = cachedDecision.boolValue;
+    }
+
+    if (desc && [desc respondsToSelector:@selector(setForceClearBackground:)]) {
+        [desc setForceClearBackground:shouldClear];
+    }
+    id fin = ((id(*)(id, SEL, id, NSError **))s_orig_finalizedIconWithDescriptor)(self, _cmd, desc, error);
+    if (fin) {
+        if (!shouldClear) {
+            objc_setAssociatedObject(fin, kDVForceKeepKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } else {
+            objc_setAssociatedObject(fin, kDVStackRefKey, self, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (cachedDecision == nil) {
+                objc_setAssociatedObject(fin, kDVDescRefKey, desc, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        }
+    }
+    return fin;
+}
+
+static ptrdiff_t s_icrGlobalConfigOffset = -1;
+static IMP s_orig_renderedSystemGlassIcon = NULL;
+static IMP s_orig_renderedIcon = NULL;
+
+static inline CGImageRef dv_invokeSysGlassWithSteps(id fin, SEL sysGlassSel, IMP sysGlassImp, id cfg, uint64_t steps) {
+    if (!cfg) {
+        return ((CGImageRef(*)(id, SEL, id))sysGlassImp)(fin, sysGlassSel, cfg);
+    }
+    if (s_icrGlobalConfigOffset < 0) {
+        Ivar ivar = class_getInstanceVariable(object_getClass(cfg), "globalConfiguration");
+        s_icrGlobalConfigOffset = ivar ? ivar_getOffset(ivar) : 0;
+    }
+    uint64_t *stepsPtr = NULL;
+    uint64_t oldSteps = 0;
+    if (s_icrGlobalConfigOffset > 0) {
+        uint8_t *base = (uint8_t *)(__bridge void *)cfg + s_icrGlobalConfigOffset;
+        // Offset +0x28 in IconRendering.GlobalConfiguration is the 64-bit pass bitmask (default 0xfff):
+        //   0x888ULL = glyphContents (0x008) | glyphShadow (0x080) | maskToIconShape (0x800) [Type A: no background]
+        //   0x889ULL = chicletFill (0x001) | glyphContents (0x008) | glyphShadow (0x080) | maskToIconShape (0x800) [Type B: flat background, no glass rim/bevel]
+        stepsPtr = (uint64_t *)(base + 0x28);
+        oldSteps = *stepsPtr;
+        *stepsPtr = steps;
+    }
+    CGImageRef cg = ((CGImageRef(*)(id, SEL, id))sysGlassImp)(fin, sysGlassSel, cfg);
+    if (stepsPtr) {
+        *stepsPtr = oldSteps;
+    }
+    return cg;
+}
+
+static CGImageRef dv_renderFinalizedIcon(id fin, SEL fallbackSel, IMP fallbackImp, id cfg) {
+    IMP sysGlassImp = s_orig_renderedSystemGlassIcon ?: fallbackImp;
+    SEL sysGlassSel = s_orig_renderedSystemGlassIcon
+        ? sel_registerName("renderedSystemGlassCompatibleIconWithConfiguration:")
+        : fallbackSel;
+    if (!sysGlassImp) return NULL;
+
+    BOOL forceKeep = [objc_getAssociatedObject(fin, kDVForceKeepKey) boolValue];
+    if (forceKeep) {
+        return dv_invokeSysGlassWithSteps(fin, sysGlassSel, sysGlassImp, cfg, 0x889ULL);
+    }
+
+    CGImageRef cgClear = dv_invokeSysGlassWithSteps(fin, sysGlassSel, sysGlassImp, cfg, 0x888ULL);
+
+    id stack = objc_getAssociatedObject(fin, kDVStackRefKey);
+    id desc  = objc_getAssociatedObject(fin, kDVDescRefKey);
+    if (!stack) {
+        return cgClear;
+    }
+    if (!desc || !s_orig_finalizedIconWithDescriptor) {
+        NSNumber *scaleNum = objc_getAssociatedObject(stack, kDVStackScaleKey);
+        if (scaleNum) {
+            double scale = scaleNum.doubleValue;
+            double cx = [objc_getAssociatedObject(stack, kDVStackCenterXKey) doubleValue];
+            double cy = [objc_getAssociatedObject(stack, kDVStackCenterYKey) doubleValue];
+            return dv_scaleTypeACGImage(cgClear, scale, cx, cy);
+        }
+        return cgClear;
+    }
+
+    double scale = 1.0, cx = 0.5, cy = 0.5;
+    BOOL shouldStrip = dv_shouldStripLayeredIconCGImage(cgClear, &scale, &cx, &cy);
+    objc_setAssociatedObject(stack, kDVStackDecisionKey, @(shouldStrip), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (shouldStrip) {
+        objc_setAssociatedObject(stack, kDVStackScaleKey, @(scale), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(stack, kDVStackCenterXKey, @(cx), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(stack, kDVStackCenterYKey, @(cy), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return dv_scaleTypeACGImage(cgClear, scale, cx, cy);
+    }
+
+    if ([desc respondsToSelector:@selector(setForceClearBackground:)]) {
+        [desc setForceClearBackground:NO];
+    }
+    id finKeep = ((id(*)(id, SEL, id, NSError **))s_orig_finalizedIconWithDescriptor)(
+        stack, sel_registerName("finalizedIconWithDescriptor:error:"), desc, NULL);
+    if (!finKeep) {
+        return cgClear;
+    }
+    return dv_invokeSysGlassWithSteps(finKeep, sysGlassSel, sysGlassImp, cfg, 0x889ULL);
+}
+
+static CGImageRef swizzled_renderedSystemGlassIcon(id self, SEL _cmd, id cfg) {
+    if (!s_core_hooks_disabled) {
+        return dv_renderFinalizedIcon(self, _cmd, s_orig_renderedSystemGlassIcon, cfg);
+    }
+    if (s_orig_renderedSystemGlassIcon) {
+        return ((CGImageRef(*)(id, SEL, id))s_orig_renderedSystemGlassIcon)(self, _cmd, cfg);
+    }
+    return NULL;
+}
+
+static CGImageRef swizzled_renderedIcon(id self, SEL _cmd, id cfg) {
+    if (!s_core_hooks_disabled) {
+        return dv_renderFinalizedIcon(self, _cmd, s_orig_renderedIcon, cfg);
+    }
+    if (s_orig_renderedIcon) {
+        return ((CGImageRef(*)(id, SEL, id))s_orig_renderedIcon)(self, _cmd, cfg);
+    }
+    return NULL;
+}
+
+static IMP s_orig_isCenterPixelTransparent = NULL;
+static BOOL swizzled_isCenterPixelTransparent(id self, SEL _cmd) {
+    if (!s_core_hooks_disabled) {
+        // When background fill is skipped, hollow icons (e.g. ChatGPT, Music, Calendar)
+        // legitimately have alpha == 0 at their exact center pixel (w/2, h/2).
+        return NO;
+    }
+    if (s_orig_isCenterPixelTransparent) {
+        return ((BOOL(*)(id, SEL))s_orig_isCenterPixelTransparent)(self, _cmd);
+    }
+    return NO;
 }
 
 static void dv_installIconJailNeutralization(void) {
@@ -1100,30 +1406,27 @@ static void dv_installIconJailNeutralization(void) {
     if (objc_getClass("IFDefaults") == Nil) {
         dlopen("/System/Library/PrivateFrameworks/IconFoundation.framework/Versions/A/IconFoundation", RTLD_LAZY | RTLD_GLOBAL);
     }
-
-    Class clsDefaults = objc_getClass("ISDefaults");
-    if (clsDefaults) {
-        dv_swizzle(clsDefaults, sel_registerName("iconStackAppIconsAllowed"), (IMP)swizzled_iconStack_returnNo, NULL);
+    if (objc_getClass("ICRFinalizationDescriptor") == Nil) {
+        dlopen("/System/Library/PrivateFrameworks/IconRendering.framework/Versions/A/IconRendering", RTLD_LAZY | RTLD_GLOBAL);
+    }
+    if (objc_getClass("CUICatalog") == Nil) {
+        dlopen("/System/Library/PrivateFrameworks/CoreUI.framework/Versions/A/CoreUI", RTLD_LAZY | RTLD_GLOBAL);
     }
 
-    Class clsIFDefaults = objc_getClass("IFDefaults");
-    if (clsIFDefaults) {
-        dv_swizzle(clsIFDefaults, sel_registerName("iconStackAppIconsAllowed"), (IMP)swizzled_iconStack_returnNo, NULL);
+    Class clsLayerStack = objc_getClass("CUINamedIconLayerStack");
+    if (clsLayerStack) {
+        dv_swizzle(clsLayerStack, sel_registerName("finalizedIconWithDescriptor:error:"), (IMP)swizzled_finalizedIconWithDescriptor, &s_orig_finalizedIconWithDescriptor);
     }
 
-    Class clsRecordProvider = objc_getClass("ISRecordResourceProvider");
-    if (clsRecordProvider) {
-        dv_swizzle(clsRecordProvider, sel_registerName("iconStackResourcesAllowed"), (IMP)swizzled_iconStack_returnNo, NULL);
+    Class clsFinalizedIcon = objc_getClass("ICRFinalizedIcon");
+    if (clsFinalizedIcon) {
+        dv_swizzle(clsFinalizedIcon, sel_registerName("renderedSystemGlassCompatibleIconWithConfiguration:"), (IMP)swizzled_renderedSystemGlassIcon, &s_orig_renderedSystemGlassIcon);
+        dv_swizzle(clsFinalizedIcon, sel_registerName("renderedIconWithConfiguration:"), (IMP)swizzled_renderedIcon, &s_orig_renderedIcon);
     }
 
-    Class clsResourceProvider = objc_getClass("ISResourceProvider");
-    if (clsResourceProvider) {
-        dv_swizzleClassMethod(clsResourceProvider, sel_registerName("resourceWithBundleURL:iconDictionary:options:"), (IMP)swizzled_resourceWithBundleURL, &s_orig_resourceWithBundleURL);
-    }
-
-    Class clsAssetCatalog = objc_getClass("ISAssetCatalogResource");
-    if (clsAssetCatalog) {
-        dv_swizzleClassMethod(clsAssetCatalog, sel_registerName("assetCatalogResourceWithURL:imageName:platform:isAppLike:error:"), (IMP)swizzled_assetCatalogResource, &s_orig_assetCatalogResource);
+    Class clsImageInspector = objc_getClass("IFImageInspector");
+    if (clsImageInspector) {
+        dv_swizzle(clsImageInspector, sel_registerName("isCenterPixelTransparent"), (IMP)swizzled_isCenterPixelTransparent, &s_orig_isCenterPixelTransparent);
     }
 
     Class clsComposite = objc_getClass("ISIconStackCompositeResource");
@@ -1133,7 +1436,13 @@ static void dv_installIconJailNeutralization(void) {
 
     Class clsMultisized = objc_getClass("ISMultisizedAppAssetCatalogResource");
     if (clsMultisized) {
-        dv_swizzle(clsMultisized, sel_registerName("imageForSize:scale:"), (IMP)swizzled_multisizedApp_imageForSize_scale, &s_orig_multisizedApp_imageForSize_scale);
+        dv_swizzle(clsMultisized, sel_registerName("imageForSize:scale:"), (IMP)swizzled_multisized_imageForSize_scale, &s_orig_multisized_imageForSize_scale);
+    }
+
+    Class clsIOSRecipe = objc_getClass("ISiOSAppRecipe");
+    if (clsIOSRecipe) {
+        dv_swizzle(clsIOSRecipe, sel_registerName("shouldApplyMask"), (IMP)swizzled_iconStack_returnNo, NULL);
+        dv_swizzle(clsIOSRecipe, sel_registerName("shouldDrawBorder"), (IMP)swizzled_iconStack_returnNo, NULL);
     }
 
     Class clsIcns = objc_getClass("ISIcns");
@@ -1192,6 +1501,7 @@ static void dv_runInitOnMainThread(void) {
         }
 
         dv_runFaultTolerant(^{
+            dv_restoreAllSwizzlesAndPatches();
             if (hasAppKit) {
                 dv_installGlassFilterNeutralization();
                 dv_installSplitViewTitlebarAlignmentFix();
