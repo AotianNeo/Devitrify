@@ -160,6 +160,12 @@ static uint64_t dv_decodeAdrpAdd(const uint32_t *insns, uint32_t reg);
 
 static void dv_writeGotSlot(void **slot, void *newSignedVal, BOOL isAuthGot) {
     if (!slot) return;
+
+    vm_address_t page = ((vm_address_t)slot) & ~0x3fffULL;
+    if (vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+        return;
+    }
+
     NSMutableDictionary<NSNumber *, NSValue *> *slotMap = dv_dynamicInterposeSlotMap();
     NSNumber *slotKey = @((uintptr_t)slot);
     if (!slotMap[slotKey]) {
@@ -171,14 +177,7 @@ static void dv_writeGotSlot(void **slot, void *newSignedVal, BOOL isAuthGot) {
         *slot = newSignedVal;
         dv_tproMakeReadonly();
     } else {
-        vm_address_t page = ((vm_address_t)slot) & ~0x3fffULL;
-        if (vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
-            *slot = newSignedVal;
-        } else {
-            dv_tproMakeWritable();
-            *slot = newSignedVal;
-            dv_tproMakeReadonly();
-        }
+        *slot = newSignedVal;
     }
 }
 
@@ -306,9 +305,12 @@ static void dv_restoreAllSwizzlesAndPatches(void) {
         void **slot = (void **)slotNum.unsignedLongLongValue;
         void *origSignedPtr = slots[slotNum].pointerValue;
         if (!slot || !origSignedPtr) continue;
-        dv_tproMakeWritable();
-        *slot = origSignedPtr;
-        dv_tproMakeReadonly();
+        vm_address_t page = ((vm_address_t)slot) & ~0x3fffULL;
+        if (vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
+            dv_tproMakeWritable();
+            *slot = origSignedPtr;
+            dv_tproMakeReadonly();
+        }
     }
 }
 
@@ -663,16 +665,19 @@ static void dv_installDynamicFeatureInterposeIfNeeded(void) {
         { (const void *)dv_core_feature_enabled, (const void *)_os_feature_enabled_impl },
         { (const void *)dv_core_program_sdk_at_least, (const void *)dyld_program_sdk_at_least },
     };
+    // Interpose main binary
+    dv_dyld_dynamic_interpose(_dyld_get_image_header(0), tuples, 2);
+
     uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = 1; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
-        if (strstr(name, "/AppKit.framework/") ||
-            strstr(name, "/SwiftUICore.framework/") ||
-            strstr(name, "/SwiftUI.framework/") ||
-            strstr(name, "/UIKitCore.framework/") ||
-            strstr(name, "FeatureFlags")) {
-            dv_dyld_dynamic_interpose(_dyld_get_image_header(i), tuples, 2);
+        uintptr_t hdr = (uintptr_t)_dyld_get_image_header(i);
+        if (hdr >= 0x180000000ULL && hdr < 0x300000000ULL) {
+            continue; // Skip dyld shared cache images: they are immutable
+        }
+        if (strstr(name, "FeatureFlags") || strstr(name, ".appex") || strstr(name, ".xpc")) {
+            dv_dyld_dynamic_interpose((const struct mach_header *)hdr, tuples, 2);
         }
     }
 }
@@ -897,6 +902,58 @@ static void dv_installSpotlightSearchResultsCrashFix(void) {
     }
 }
 
+// In macOS 26, -[NSTextFieldCell _resolvedStyleInView:] and -[NSTextFieldCell _bezelConfigurationInView:]
+// branch on dyld_program_sdk_at_least(macOS 26.0) instead of NSSolariumEnabled(). When a macOS 26 SDK binary
+// configures NSTextFieldRoundedBezel (1) with default borderShape == NSControlBorderShapeAutomatic (0)
+// (e.g. LACUIPasswordField in LocalAuthenticationRemoteService or SwiftUI .textFieldStyle(.roundedBorder)),
+// NSTextFieldCell ignores bezelStyle == 1 and resolves to style 3 (widget = "textfield", borderShape = 2).
+// Under NSTextFieldAppearanceBasedVisualProvider (Aqua.car), style 3 is the legacy square bezel with a hardcoded
+// 21pt height regardless of controlSize, whereas style 4 (widget = "textfieldround", borderShape = 1) is the
+// Sequoia rounded-rect bezel that respects controlSize (Large = 30pt frame / 28pt visual, Regular = 22pt, etc.).
+static IMP s_orig_tfCell_resolvedStyleInView = NULL;
+static NSInteger swizzled_tfCell_resolvedStyleInView(NSTextFieldCell *self, SEL _cmd, NSView *view) {
+    NSInteger style = s_orig_tfCell_resolvedStyleInView
+        ? ((NSInteger (*)(id, SEL, NSView *))s_orig_tfCell_resolvedStyleInView)(self, _cmd, view)
+        : 0;
+    if (!s_core_hooks_disabled && [self isBezeled] && [self bezelStyle] == NSTextFieldRoundedBezel) {
+        SEL bsSel = sel_registerName("borderShape");
+        NSInteger bs = [self respondsToSelector:bsSel] ? ((NSInteger (*)(id, SEL))objc_msgSend)(self, bsSel) : 0;
+        if (bs == 0) {
+            if (style == 3 || style == 7) return 4;
+            if (style == 5) return 6;
+        }
+    }
+    return style;
+}
+
+static IMP s_orig_tfCell_bezelConfigurationInView = NULL;
+static id swizzled_tfCell_bezelConfigurationInView(NSTextFieldCell *self, SEL _cmd, NSView *view) {
+    id cfg = s_orig_tfCell_bezelConfigurationInView
+        ? ((id (*)(id, SEL, NSView *))s_orig_tfCell_bezelConfigurationInView)(self, _cmd, view)
+        : nil;
+    if (!s_core_hooks_disabled && cfg && [self isBezeled] && [self bezelStyle] == NSTextFieldRoundedBezel) {
+        SEL bsSel = sel_registerName("borderShape");
+        NSInteger bs = [self respondsToSelector:bsSel] ? ((NSInteger (*)(id, SEL))objc_msgSend)(self, bsSel) : 0;
+        if (bs == 0) {
+            SEL setBsSel = sel_registerName("setBorderShape:");
+            if ([cfg respondsToSelector:setBsSel]) {
+                ((void (*)(id, SEL, NSInteger))objc_msgSend)(cfg, setBsSel, 1);
+            }
+            SEL setStyleSel = sel_registerName("setStyle:");
+            if ([cfg respondsToSelector:setStyleSel]) {
+                SEL styleSel = sel_registerName("style");
+                NSInteger curStyle = [cfg respondsToSelector:styleSel] ? ((NSInteger (*)(id, SEL))objc_msgSend)(cfg, styleSel) : 0;
+                if (curStyle == 3 || curStyle == 7) {
+                    ((void (*)(id, SEL, NSInteger))objc_msgSend)(cfg, setStyleSel, 4);
+                } else if (curStyle == 5) {
+                    ((void (*)(id, SEL, NSInteger))objc_msgSend)(cfg, setStyleSel, 6);
+                }
+            }
+        }
+    }
+    return cfg;
+}
+
 static void dv_installClassicAppKit(void) {
     dv_installDynamicFeatureInterposeIfNeeded();
     dv_syncSolariumInMemoryCaches(YES);
@@ -914,6 +971,13 @@ static void dv_installClassicAppKit(void) {
     Class splitImplProviderCls = NSClassFromString(@"UISplitViewControllerDefaultImplProvider");
     if (splitImplProviderCls) {
         dv_swizzle(splitImplProviderCls, NSSelectorFromString(@"implClassForSplitViewController:"), (IMP)swizzled_splitvc_implClass, &s_orig_splitvc_implClass);
+    }
+    Class tfCellCls = [NSTextFieldCell class];
+    if (tfCellCls) {
+        dv_swizzle(tfCellCls, sel_registerName("_resolvedStyleInView:"),
+                   (IMP)swizzled_tfCell_resolvedStyleInView, &s_orig_tfCell_resolvedStyleInView);
+        dv_swizzle(tfCellCls, sel_registerName("_bezelConfigurationInView:"),
+                   (IMP)swizzled_tfCell_bezelConfigurationInView, &s_orig_tfCell_bezelConfigurationInView);
     }
 }
 
@@ -964,6 +1028,18 @@ static void dv_refreshSubviewsRecursively(NSView *v, BOOL hooksActive) {
                     ((void (*)(id, SEL, id))objc_msgSend)(v, scUpdSel, sc);
                 }
             }
+        }
+    }
+    if ([v isKindOfClass:[NSTextField class]]) {
+        NSTextField *tf = (NSTextField *)v;
+        NSCell *cell = tf.cell;
+        SEL refreshSel = sel_registerName("_refreshVisualProvider");
+        if (cell && [cell respondsToSelector:refreshSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(cell, refreshSel);
+        }
+        [tf invalidateIntrinsicContentSize];
+        if (tf.superview) {
+            [tf.superview setNeedsLayout:YES];
         }
     }
     [v setNeedsLayout:YES];

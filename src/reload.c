@@ -161,6 +161,19 @@ static int inspect_process_images(pid_t pid, int *out_has_appkit, int *out_has_d
 
     mach_port_t task = MACH_PORT_NULL;
     if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "vmmap -pages %d 2>/dev/null", pid);
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                if (out_has_appkit && !*out_has_appkit && strstr(line, "AppKit")) *out_has_appkit = 1;
+                if (out_has_devitrify && !*out_has_devitrify && strstr(line, "Devitrify")) *out_has_devitrify = 1;
+                if (*out_has_appkit && *out_has_devitrify) break;
+            }
+            pclose(fp);
+            return (*out_has_appkit != 0);
+        }
         return 0;
     }
 
@@ -268,7 +281,9 @@ static const uint32_t s_inject_code[] = {
 static int inject_dylib_into_pid(pid_t pid, const char *dylib_path) {
     mach_port_t task = MACH_PORT_NULL;
     if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
-        return 0;
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "lldb -p %d --batch -o 'expr -l objc++ -- (void*)dlopen(\"%s\", 2)' >/dev/null 2>&1", pid, dylib_path);
+        return (system(cmd) == 0);
     }
 
     mach_vm_address_t remote_page = 0, remote_stack = 0;
@@ -390,18 +405,23 @@ static void scan_or_inject_running_apps(const char *dylib_path, int do_inject, i
         NSArray<NSRunningApplication *> *apps = [[NSWorkspace sharedWorkspace] runningApplications];
         pid_t self_pid = getpid();
         for (NSRunningApplication *app in apps) {
-            if (app.activationPolicy == NSApplicationActivationPolicyProhibited) continue;
             pid_t pid = app.processIdentifier;
             if (pid <= 1 || pid == self_pid || is_pid_translated(pid)) continue;
 
             NSString *bundlePath = app.bundleURL.path;
-            if (!bundlePath || ![bundlePath hasSuffix:@".app"]) continue;
-            if ([bundlePath rangeOfString:@".app/Contents/"].location != NSNotFound) continue;
+            BOOL isApp = bundlePath && [bundlePath hasSuffix:@".app"] && [bundlePath rangeOfString:@".app/Contents/"].location == NSNotFound;
+            BOOL isAppEx = bundlePath && [bundlePath hasSuffix:@".appex"];
+            BOOL isXPC = bundlePath && [bundlePath hasSuffix:@".xpc"];
+            if (!isApp && !isAppEx && !isXPC) continue;
+
+            if (!isAppEx && !isXPC && app.activationPolicy == NSApplicationActivationPolicyProhibited) continue;
 
             NSString *bid = app.bundleIdentifier ?: @"";
             if ([bid isEqualToString:@"com.apple.loginwindow"] ||
                 [bid isEqualToString:@"com.apple.dock"] ||
-                [bid isEqualToString:@"com.apple.ProblemReporter"]) continue;
+                [bid isEqualToString:@"com.apple.ProblemReporter"] ||
+                [bid isEqualToString:@"com.apple.WebKit.GPU"] ||
+                [bid isEqualToString:@"com.apple.WebKit.Networking"]) continue;
 
             NSString *exeName = app.executableURL.lastPathComponent ?: app.localizedName;
             if (is_exe_bypassed(exeName)) continue;
