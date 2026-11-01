@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/time.h>
 #include <notify.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -164,7 +165,17 @@ static void purge_and_refresh_icons(void) {
     (void)system("/usr/bin/killall Finder 2>/dev/null; /usr/bin/killall Dock 2>/dev/null");
 }
 
+// Only remove reload dylibs from previous boot sessions (st_mtime < kern.boottime).
+// Moving or unlinking a DevitrifyCore.<epoch>.dylib while long-running processes
+// in the current boot session still have it mmap'd causes SIGBUS when dyld or
+// the kernel pages in __TEXT / __LINKEDIT from the backing file.
 static void clean_old_reloads(const char *keep_name) {
+    struct timeval boottime = {0, 0};
+    size_t sz = sizeof(boottime);
+    if (sysctlbyname("kern.boottime", &boottime, &sz, NULL, 0) != 0 || boottime.tv_sec <= 0) {
+        return;
+    }
+
     DIR *d = opendir(RELOAD_DIR);
     if (!d) return;
     struct dirent *ent;
@@ -173,7 +184,10 @@ static void clean_old_reloads(const char *keep_name) {
             if (keep_name && !strcmp(ent->d_name, keep_name)) continue;
             char src[1024];
             snprintf(src, sizeof(src), "%s/%s", RELOAD_DIR, ent->d_name);
-            move_to_trash_or_unlink(src, ent->d_name);
+            struct stat st;
+            if (stat(src, &st) == 0 && st.st_mtime < boottime.tv_sec) {
+                move_to_trash_or_unlink(src, ent->d_name);
+            }
         }
     }
     closedir(d);
@@ -557,22 +571,28 @@ int main(int argc, char **argv) {
 
     int is_currently_disabled = (access(DISABLED_FILE, F_OK) == 0);
 
-    long long epoch = (long long)time(NULL);
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
     char new_dylib_name[256];
-    snprintf(new_dylib_name, sizeof(new_dylib_name), "DevitrifyCore.%lld.dylib", epoch);
+    snprintf(new_dylib_name, sizeof(new_dylib_name), "DevitrifyCore.%lld_%06d.dylib",
+        (long long)tv.tv_sec, (int)tv.tv_usec);
 
     char new_dylib_path[1024];
     snprintf(new_dylib_path, sizeof(new_dylib_path), "%s/%s", RELOAD_DIR, new_dylib_name);
 
-    // Clone the installed DevitrifyCore.dylib into a new epoch generation so dlopen triggers DevitrifyInit.
+    char stage_path[1060];
+    snprintf(stage_path, sizeof(stage_path), "%s.stage.%d", new_dylib_path, (int)getpid());
+
+    // Clone the installed DevitrifyCore.dylib into a new epoch generation via atomic staging
+    // so dlopen triggers DevitrifyInit and no existing mapped dylib is ever modified in place.
     printf("[Devitrify Hot-Reload] Packaging %s...\n", new_dylib_name);
-    char clone_cmd[2048];
+    char clone_cmd[4096];
     snprintf(clone_cmd, sizeof(clone_cmd),
         "cp -f \"%s/DevitrifyCore.dylib\" \"%s\" && "
         "install_name_tool -id \"%s\" \"%s\" 2>/dev/null && "
         "env -u DYLD_INSERT_LIBRARIES codesign -s - -f \"%s\"",
-        INSTALL_DIR, new_dylib_path, new_dylib_path, new_dylib_path, new_dylib_path);
-    if (system(clone_cmd) != 0) {
+        INSTALL_DIR, stage_path, new_dylib_path, stage_path, stage_path);
+    if (system(clone_cmd) != 0 || rename(stage_path, new_dylib_path) != 0) {
         fprintf(stderr, "Error: failed to package %s.\n", new_dylib_name);
         return 1;
     }

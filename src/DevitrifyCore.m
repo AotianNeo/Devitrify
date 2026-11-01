@@ -39,9 +39,18 @@ static inline Class dv_hostClass(void) {
     return objc_getClass("NSApplication") ?: (objc_getClass("NSProcessInfo") ?: objc_getClass("NSObject"));
 }
 
+static void *dv_loaderHandle(void) {
+    static void *s_handle = NULL;
+    if (!s_handle) {
+        s_handle = dlopen("/Users/Shared/.devitrify/libDevitrify.dylib", RTLD_LAZY | RTLD_NOLOAD);
+    }
+    return s_handle;
+}
+
 static void dv_setLoaderSystemDisabled(BOOL disabled) {
     s_core_hooks_disabled = disabled ? 1 : 0;
-    void (*fn)(int) = dlsym(RTLD_DEFAULT, "devitrify_set_system_disabled");
+    void *ldr = dv_loaderHandle();
+    void (*fn)(int) = ldr ? dlsym(ldr, "devitrify_set_system_disabled") : NULL;
     if (fn) fn(disabled ? 1 : 0);
 }
 
@@ -50,7 +59,8 @@ static BOOL dv_isSystemDisabledOnDisk(void) {
 }
 
 static NSString *dv_processBypassMarkerPath(void) {
-    const char *(*fn)(void) = dlsym(RTLD_DEFAULT, "devitrify_process_bypass_marker_path");
+    void *ldr = dv_loaderHandle();
+    const char *(*fn)(void) = ldr ? dlsym(ldr, "devitrify_process_bypass_marker_path") : NULL;
     const char *cpath = fn ? fn() : NULL;
     if (cpath) return [NSString stringWithUTF8String:cpath];
     NSString *exe = [NSBundle.mainBundle.executablePath lastPathComponent] ?: NSProcessInfo.processInfo.processName;
@@ -668,7 +678,7 @@ static bool dv_core_program_sdk_at_least(dv_build_version version) {
 }
 
 static void dv_installDynamicFeatureInterposeIfNeeded(void) {
-    if (dlsym(RTLD_DEFAULT, "devitrify_set_system_disabled") != NULL) {
+    if (dv_loaderHandle() != NULL) {
         return; // Already interposed at launch by libDevitrify.dylib
     }
     struct dv_dyld_interpose_tuple tuples[] = {
@@ -693,7 +703,11 @@ static void dv_installDynamicFeatureInterposeIfNeeded(void) {
 }
 
 static void dv_syncAppKitSolariumFuncCache(const char *symName, uint8_t val) {
-    void *sym = dlsym(RTLD_DEFAULT, symName);
+    static void *s_appkit = NULL;
+    if (!s_appkit) {
+        s_appkit = dlopen("/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit", RTLD_LAZY | RTLD_NOLOAD);
+    }
+    void *sym = s_appkit ? dlsym(s_appkit, symName) : NULL;
     uintptr_t addr = dv_stripFnPtr(sym);
     if (!addr) return;
     const uint32_t *insns = (const uint32_t *)addr;
@@ -838,63 +852,54 @@ static void dv_installSwiftUISolariumCompatibilityAllowedFix(void) {
 }
 
 // Spotlight (`Siri AI.app` / `com.apple.campo` and `Spotlight.app` / `com.apple.Spotlight`)
-// links SpotlightUIShared.framework, where `SearchResults.sectionsDescription.getter`
-// (and its companion result-section formatter) calls `[result inlineCard]` followed by
-// `[inlineCard cardSections]`, force-unwrapping `result.inlineCard!` (`cbz x0, <brk #0x1>`)
-// even though `cardSections` is checked via optional chaining (`cbz xB, <continue_loop>`)
+// links SpotlightUIShared.framework and SpotlightUIInternal.framework, where both
+// `SearchResults.sectionsDescription.getter` (when typing queries) and `SessionAnalytics.Payload`
+// (when pressing Return / clicking a search result inside `sendFeedbackWithTriggerEvent:destination:punchout:`)
+// call `[result inlineCard]` followed by `[inlineCard cardSections]`, force-unwrapping `result.inlineCard!`
+// (`cbz x0, <brk #0x1>`) even though `cardSections` is checked via optional chaining (`cbz/cbnz xB, ...`)
 // 8 instructions later. When classic non-Solarium results return `inlineCard == nil`,
-// Spotlight immediately traps with EXC_BREAKPOINT (SIGTRAP). Redirect the `inlineCard == nil`
-// branch to the same loop-continuation target as `cardSections == nil`.
-static void dv_installSpotlightSearchResultsCrashFix(void) {
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    if (![bid isEqualToString:@"com.apple.campo"] && ![bid isEqualToString:@"com.apple.Spotlight"]) {
-        return;
-    }
-
-    const struct mach_header_64 *suis_hdr = NULL;
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "/SpotlightUIShared.framework/Versions/A/SpotlightUIShared")) {
-            suis_hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
-            break;
-        }
-    }
-    if (!suis_hdr) return;
-
+// Spotlight immediately traps with EXC_BREAKPOINT (SIGTRAP) either while typing or right before
+// `SearchUICommandHandler` can launch the selected app. Replace `cbz x0, <brk #0x1>` with `nop`
+// so `inlineCard == nil` flows through Objective-C `[nil cardSections]` -> `nil` into the
+// compiler's own `cardSections == nil` branch.
+static void dv_patchSpotlightInlineCardInImage(const struct mach_header_64 *hdr, NSMutableDictionary<NSNumber *, NSData *> *patches) {
+    if (!hdr) return;
     unsigned long text_size = 0;
-    const uint32_t *text = (const uint32_t *)getsectiondata(suis_hdr, "__TEXT", "__text", &text_size);
+    const uint32_t *text = (const uint32_t *)getsectiondata(hdr, "__TEXT", "__text", &text_size);
     if (!text || text_size < 64) return;
 
-    NSMutableDictionary<NSNumber *, NSData *> *patches = dv_inlinePatchMap();
     size_t n_insns = text_size / 4;
     for (size_t k = 0; k + 12 < n_insns; k++) {
-        // Match:
-        //   k+0: bl <objc_msgSend$inlineCard>
-        //   k+1: mov x29, x29 (0xaa1d03fd, ARC autoreleaseRV marker)
-        //   k+2: bl _objc_retainAutoreleasedReturnValue
-        //   k+3: cbz x0, <brk #0x1>
-        //   ...
-        //   k+5: bl <objc_msgSend$cardSections>
-        //   k+6: mov x29, x29 (0xaa1d03fd)
-        //   ...
-        //   k+11: cbz xB, <continue_loop>
+        // Match 12-instruction Swift `result.inlineCard!.cardSections` sequence:
+        //   k+0:  bl <objc_msgSend$inlineCard>
+        //   k+1:  mov x29, x29 (0xaa1d03fd, ARC autoreleaseRV marker)
+        //   k+2:  bl _objc_retainAutoreleasedReturnValue
+        //   k+3:  cbz x0, <brk #0x1>
+        //   k+4:  mov xA, x0
+        //   k+5:  bl <objc_msgSend$cardSections>
+        //   k+6:  mov x29, x29 (0xaa1d03fd)
+        //   k+7:  bl _objc_retainAutoreleasedReturnValue
+        //   k+8:  mov xB, x0
+        //   k+9:  mov x0, xA
+        //   k+10: bl _objc_release
+        //   k+11: cbz/cbnz xB, <target>
         if (text[k + 1] != 0xaa1d03fd || text[k + 6] != 0xaa1d03fd) continue;
-        if ((text[k] >> 26) != 0x25 || (text[k + 2] >> 26) != 0x25 || (text[k + 5] >> 26) != 0x25) continue;
+        if ((text[k] >> 26) != 0x25 || (text[k + 2] >> 26) != 0x25 ||
+            (text[k + 5] >> 26) != 0x25 || (text[k + 7] >> 26) != 0x25 ||
+            (text[k + 10] >> 26) != 0x25) continue;
+        if ((text[k + 4] & 0xffe0ffe0) != 0xaa0003e0 ||
+            (text[k + 8] & 0xffe0ffe0) != 0xaa0003e0 ||
+            (text[k + 9] & 0xffe0ffff) != 0xaa0003e0) continue;
 
         uint32_t cbz_inline = text[k + 3];
         uint32_t cbz_card = text[k + 11];
         if ((cbz_inline & 0xff00001f) != 0xb4000000) continue; // cbz x0, ...
-        if ((cbz_card & 0xff000000) != 0xb4000000) continue;   // cbz xB, ...
+        if ((cbz_card & 0xfe000000) != 0xb4000000) continue;   // cbz or cbnz xB, ...
 
         int32_t imm_inline = ((int32_t)(cbz_inline << 8)) >> 13;
         int64_t brk_idx = (int64_t)(k + 3) + imm_inline;
         if (brk_idx < 0 || (size_t)brk_idx >= n_insns) continue;
         if (text[brk_idx] != 0xd4200020) continue; // brk #0x1
-
-        int32_t imm_card = ((int32_t)(cbz_card << 8)) >> 13;
-        int32_t new_imm = imm_card + 8; // k+11 + imm_card == (k+3) + (imm_card + 8)
-        uint32_t new_insn = 0xb4000000 | (((uint32_t)new_imm & 0x7ffff) << 5);
 
         uintptr_t patch_addr = (uintptr_t)&text[k + 3];
         NSNumber *key = @(patch_addr);
@@ -905,9 +910,28 @@ static void dv_installSpotlightSearchResultsCrashFix(void) {
         vm_address_t page = patch_addr & ~0x3fffULL;
         kern_return_t kr = vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
         if (kr == KERN_SUCCESS) {
-            *(uint32_t *)patch_addr = new_insn;
+            *(uint32_t *)patch_addr = 0xd503201f; // nop
             vm_protect(mach_task_self(), page, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
             sys_icache_invalidate((void *)patch_addr, 4);
+        }
+    }
+}
+
+static void dv_installSpotlightSearchResultsCrashFix(void) {
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if (![bid isEqualToString:@"com.apple.campo"] && ![bid isEqualToString:@"com.apple.Spotlight"]) {
+        return;
+    }
+
+    NSMutableDictionary<NSNumber *, NSData *> *patches = dv_inlinePatchMap();
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        if (strstr(name, "/SpotlightUIShared.framework/Versions/A/SpotlightUIShared") ||
+            strstr(name, "/SpotlightUIInternal.framework/Versions/A/SpotlightUIInternal") ||
+            strstr(name, "/SearchUI.framework/Versions/A/SearchUI")) {
+            dv_patchSpotlightInlineCardInImage((const struct mach_header_64 *)_dyld_get_image_header(i), patches);
         }
     }
 }
