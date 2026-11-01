@@ -785,10 +785,49 @@ static CGFloat swizzled_partitionAdapter_dividerWidth(id self, SEL _cmd) {
         : 1.0;
 }
 
+static IMP s_orig_scrollView_keyPathsAffectingSeparatorOffset = NULL;
+static NSSet<NSString *> *swizzled_scrollView_keyPathsAffectingSeparatorOffset(id self, SEL _cmd) {
+    if (!s_core_hooks_disabled) {
+        return [NSSet setWithObjects:@"safeAreaRect", @"safeAreaInsets", @"bounds", nil];
+    }
+    return s_orig_scrollView_keyPathsAffectingSeparatorOffset
+        ? ((NSSet<NSString *> *(*)(id, SEL))s_orig_scrollView_keyPathsAffectingSeparatorOffset)(self, _cmd)
+        : [NSSet setWithObjects:@"safeAreaRect", nil];
+}
+
+static IMP s_orig_wscc_updateSectionStateIfNeeded = NULL;
+static void swizzled_wscc_updateSectionStateIfNeeded(id self, SEL _cmd) {
+    if (!s_core_hooks_disabled) {
+        SEL svAdapterSel = NSSelectorFromString(@"scrollViewTrackingAdapter");
+        SEL sepOffsetSel = NSSelectorFromString(@"separatorOffset");
+        SEL setSepOffsetSel = NSSelectorFromString(@"setSeparatorOffset:");
+        if ([self respondsToSelector:svAdapterSel] && [self respondsToSelector:setSepOffsetSel]) {
+            id adapter = ((id (*)(id, SEL))objc_msgSend)(self, svAdapterSel);
+            if (adapter && [adapter respondsToSelector:sepOffsetSel]) {
+                CGFloat offset = ((CGFloat (*)(id, SEL))objc_msgSend)(adapter, sepOffsetSel);
+                ((void (*)(id, SEL, CGFloat))objc_msgSend)(self, setSepOffsetSel, offset);
+            }
+        }
+    }
+    if (s_orig_wscc_updateSectionStateIfNeeded) {
+        ((void (*)(id, SEL))s_orig_wscc_updateSectionStateIfNeeded)(self, _cmd);
+    }
+}
+
 static void dv_installSplitViewTitlebarAlignmentFix(void) {
     Class adapterCls = NSClassFromString(@"_NSSplitViewPartitionAdapter");
     if (adapterCls) {
         dv_swizzle(adapterCls, NSSelectorFromString(@"dividerWidth"), (IMP)swizzled_partitionAdapter_dividerWidth, &s_orig_partitionAdapter_dividerWidth);
+    }
+    Class svCls = [NSScrollView class];
+    if (svCls) {
+        dv_swizzleClassMethod(svCls, NSSelectorFromString(@"keyPathsForValuesAffectingSeparatorOffset"),
+                              (IMP)swizzled_scrollView_keyPathsAffectingSeparatorOffset, &s_orig_scrollView_keyPathsAffectingSeparatorOffset);
+    }
+    Class wsccCls = NSClassFromString(@"NSWindowSectionContentController");
+    if (wsccCls) {
+        dv_swizzle(wsccCls, NSSelectorFromString(@"updateSectionStateIfNeeded"),
+                   (IMP)swizzled_wscc_updateSectionStateIfNeeded, &s_orig_wscc_updateSectionStateIfNeeded);
     }
 }
 
