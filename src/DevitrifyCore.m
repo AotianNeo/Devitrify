@@ -3,6 +3,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import <execinfo.h>
 #import <notify.h>
 #import <signal.h>
 #import <setjmp.h>
@@ -610,11 +611,18 @@ extern bool dyld_program_sdk_at_least(dv_build_version version);
 
 static volatile int s_core_in_solarium_compute_values = 0;
 
-static bool dv_core_caller_is_swift_feature_flags(const void *address) {
-    Dl_info info;
-    if (!dladdr(address, &info) || !info.dli_fname) return false;
-    return strstr(info.dli_fname, "/SwiftUICore.framework/") != NULL ||
-           strstr(info.dli_fname, "FeatureFlags") != NULL;
+static bool dv_core_caller_is_swiftuicore(void) {
+    void *bt[6];
+    int n = backtrace(bt, 6);
+    for (int i = 1; i < n; i++) {
+        Dl_info info;
+        if (dladdr(bt[i], &info) && info.dli_fname) {
+            if (strstr(info.dli_fname, "/SwiftUICore.framework/") != NULL) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 static bool dv_core_feature_enabled(const char *domain, const char *feature) {
@@ -623,11 +631,13 @@ static bool dv_core_feature_enabled(const char *domain, const char *feature) {
     }
     if (domain && feature) {
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "flexiGlassMacOS")) return true;
+        if (!strcmp(domain, "IconServices") && !strcmp(feature, "SolariumCornerRadius")) return false;
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) {
-            if (dv_core_caller_is_swift_feature_flags(__builtin_return_address(0))) {
+            if (dv_core_caller_is_swiftuicore()) {
                 s_core_in_solarium_compute_values = 1;
                 return true;
             }
+            return false;
         }
     }
     return _os_feature_enabled_impl(domain, feature);
@@ -1203,6 +1213,13 @@ static id swizzled_composite_imageForSize_scale(id self, SEL _cmd, CGSize size, 
 - (id)_lookupForSize:(CGSize)size scale:(double)scale;
 - (CGImageRef)image;
 - (id)initWithCGImage:(CGImageRef)cg scale:(double)scale;
+- (NSInteger)appearanceVariant;
+- (void)setAppearanceVariant:(NSInteger)av;
+- (NSInteger)background;
+- (void)setBackground:(NSInteger)bg;
+- (BOOL)placeholder;
+- (void)prepareImagesForImageDescriptors:(NSArray *)descs;
+- (id)imageLayer;
 @end
 
 static const void *kDVStackRefKey      = &kDVStackRefKey;
@@ -1551,6 +1568,188 @@ static BOOL swizzled_isCenterPixelTransparent(id self, SEL _cmd) {
     return NO;
 }
 
+static void dv_normalizeISImageDescriptor(id desc) {
+    if (!desc || s_core_hooks_disabled) return;
+    if ([desc respondsToSelector:@selector(appearanceVariant)] &&
+        [desc respondsToSelector:@selector(setAppearanceVariant:)]) {
+        if ([desc appearanceVariant] != 0) {
+            [desc setAppearanceVariant:0];
+        }
+    }
+    if ([desc respondsToSelector:@selector(background)] &&
+        [desc respondsToSelector:@selector(setBackground:)]) {
+        if ([desc background] != 0) {
+            [desc setBackground:0];
+        }
+    }
+}
+
+static IMP s_orig_isicon_prepareImages = NULL;
+static void swizzled_isicon_prepareImages(id self, SEL _cmd, NSArray *descs) {
+    if (!s_core_hooks_disabled && [descs isKindOfClass:[NSArray class]]) {
+        for (id d in descs) {
+            dv_normalizeISImageDescriptor(d);
+        }
+    }
+    if (s_orig_isicon_prepareImages) {
+        ((void (*)(id, SEL, NSArray *))s_orig_isicon_prepareImages)(self, _cmd, descs);
+    }
+}
+
+static __thread int s_in_isicon_retry = 0;
+static IMP s_orig_isicon_imageForDescriptor = NULL;
+static id swizzled_isicon_imageForDescriptor(id self, SEL _cmd, id desc) {
+    if (!s_core_hooks_disabled) {
+        dv_normalizeISImageDescriptor(desc);
+    }
+    id img = s_orig_isicon_imageForDescriptor
+        ? ((id (*)(id, SEL, id))s_orig_isicon_imageForDescriptor)(self, _cmd, desc)
+        : nil;
+    if (!s_core_hooks_disabled && !s_in_isicon_retry && desc) {
+        BOOL isPh = (!img || ([img respondsToSelector:@selector(placeholder)] && [img placeholder]));
+        if (isPh && [self respondsToSelector:@selector(prepareImagesForImageDescriptors:)]) {
+            s_in_isicon_retry = 1;
+            @try {
+                [self prepareImagesForImageDescriptors:@[desc]];
+                if (s_orig_isicon_imageForDescriptor) {
+                    img = ((id (*)(id, SEL, id))s_orig_isicon_imageForDescriptor)(self, _cmd, desc);
+                }
+            } @catch (id ex) {}
+            s_in_isicon_retry = 0;
+        }
+    }
+    return img;
+}
+
+static Class dv_classImplementingSelector(Class cls, SEL sel) {
+    while (cls) {
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(cls, &count);
+        BOOL found = NO;
+        for (unsigned int i = 0; i < count; i++) {
+            if (method_getName(methods[i]) == sel) {
+                found = YES;
+                break;
+            }
+        }
+        if (methods) free(methods);
+        if (found) return cls;
+        cls = class_getSuperclass(cls);
+    }
+    return Nil;
+}
+
+static IMP s_orig_iconAppearance_style = NULL;
+static uint8_t swizzled_iconAppearance_style(id self, SEL _cmd) {
+    if (!s_core_hooks_disabled) {
+        return 0;
+    }
+    return s_orig_iconAppearance_style
+        ? ((uint8_t (*)(id, SEL))s_orig_iconAppearance_style)(self, _cmd)
+        : 0;
+}
+
+static IMP s_orig_iconAppearance_iconDesc = NULL;
+static id swizzled_iconAppearance_iconDesc(id self, SEL _cmd) {
+    id desc = s_orig_iconAppearance_iconDesc
+        ? ((id (*)(id, SEL))s_orig_iconAppearance_iconDesc)(self, _cmd)
+        : nil;
+    if (!s_core_hooks_disabled && desc) {
+        SEL appSel = sel_registerName("appearance");
+        SEL setAppSel = sel_registerName("setAppearance:");
+        if ([desc respondsToSelector:appSel] && [desc respondsToSelector:setAppSel]) {
+            if (((NSInteger (*)(id, SEL))objc_msgSend)(desc, appSel) != 0) {
+                ((void (*)(id, SEL, NSInteger))objc_msgSend)(desc, setAppSel, 0);
+            }
+        }
+        dv_normalizeISImageDescriptor(desc);
+    }
+    return desc;
+}
+
+static IMP s_orig_iconAppearance_mitigatedDesc = NULL;
+static id swizzled_iconAppearance_mitigatedDesc(id self, SEL _cmd) {
+    id desc = s_orig_iconAppearance_mitigatedDesc
+        ? ((id (*)(id, SEL))s_orig_iconAppearance_mitigatedDesc)(self, _cmd)
+        : nil;
+    if (!s_core_hooks_disabled && desc) {
+        SEL appSel = sel_registerName("appearance");
+        SEL setAppSel = sel_registerName("setAppearance:");
+        if ([desc respondsToSelector:appSel] && [desc respondsToSelector:setAppSel]) {
+            if (((NSInteger (*)(id, SEL))objc_msgSend)(desc, appSel) != 0) {
+                ((void (*)(id, SEL, NSInteger))objc_msgSend)(desc, setAppSel, 0);
+            }
+        }
+        dv_normalizeISImageDescriptor(desc);
+    }
+    return desc;
+}
+
+static IMP s_orig_tileLayer_setGlassBgStyle = NULL;
+static void swizzled_tileLayer_setGlassBgStyle(id self, SEL _cmd, NSUInteger style) {
+    if (!s_core_hooks_disabled) {
+        style = 0;
+    }
+    if (s_orig_tileLayer_setGlassBgStyle) {
+        ((void (*)(id, SEL, NSUInteger))s_orig_tileLayer_setGlassBgStyle)(self, _cmd, style);
+    }
+}
+
+static void dv_sampleSquircleCornerPoints(CGImageRef cg, int *outTransparentCount, int *outWhiteCount) {
+    *outTransparentCount = 0;
+    *outWhiteCount = 0;
+    if (!cg || CFGetTypeID(cg) != CGImageGetTypeID()) return;
+    const int w = 64, h = 64;
+    uint8_t buf[64 * 64 * 4];
+    memset(buf, 0, sizeof(buf));
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return;
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+    CGContextRelease(ctx);
+
+    const int pts[4][2] = { {10, 10}, {53, 10}, {10, 53}, {53, 53} };
+    for (int i = 0; i < 4; i++) {
+        const uint8_t *p = buf + (pts[i][1] * w + pts[i][0]) * 4;
+        uint8_t a = p[3];
+        if (a < 15) {
+            (*outTransparentCount)++;
+        } else if (a > 200) {
+            int r = (p[0] * 255) / a;
+            int g = (p[1] * 255) / a;
+            int b = (p[2] * 255) / a;
+            if (r > 205 && g > 205 && b > 205) {
+                (*outWhiteCount)++;
+            }
+        }
+    }
+}
+
+static IMP s_orig_tileLayer_setReplacementAppImage = NULL;
+static void swizzled_tileLayer_setReplacementAppImage(id self, SEL _cmd, CGImageRef img, NSUInteger style) {
+    if (!s_core_hooks_disabled) {
+        style = 0;
+        if (img && [self respondsToSelector:@selector(imageLayer)]) {
+            CALayer *imgLayer = [self imageLayer];
+            CGImageRef existing = (__bridge CGImageRef)[imgLayer contents];
+            if (existing) {
+                int exTrans = 0, exWhite = 0, repTrans = 0, repWhite = 0;
+                dv_sampleSquircleCornerPoints(existing, &exTrans, &exWhite);
+                dv_sampleSquircleCornerPoints(img, &repTrans, &repWhite);
+                // Reject fallback .icns white-squircle replacement images (e.g. from running Chrome)
+                // when the tile already has an unjailed Type A icon with transparent squircle corners.
+                if (exTrans >= 3 && repWhite >= 3) {
+                    return;
+                }
+            }
+        }
+    }
+    if (s_orig_tileLayer_setReplacementAppImage) {
+        ((void (*)(id, SEL, CGImageRef, NSUInteger))s_orig_tileLayer_setReplacementAppImage)(self, _cmd, img, style);
+    }
+}
+
 static void dv_installIconJailNeutralization(void) {
     if (objc_getClass("ISRecordResourceProvider") == Nil) {
         dlopen("/System/Library/PrivateFrameworks/IconServices.framework/Versions/A/IconServices", RTLD_LAZY | RTLD_GLOBAL);
@@ -1602,13 +1801,33 @@ static void dv_installIconJailNeutralization(void) {
         dv_swizzle(clsIcns, sel_registerName("CGImageWithData:iconIndexInfo:"), (IMP)swizzled_CGImageWithData_iconIndexInfo, &s_orig_cgimage_with_data);
     }
 
+    Class clsISIconBase = objc_getClass("ISConcreteIcon") ?: objc_getClass("ISIcon");
+    if (clsISIconBase) {
+        SEL prepSel = sel_registerName("prepareImagesForImageDescriptors:");
+        Class prepCls = dv_classImplementingSelector(clsISIconBase, prepSel);
+        if (prepCls) {
+            dv_swizzle(prepCls, prepSel, (IMP)swizzled_isicon_prepareImages, &s_orig_isicon_prepareImages);
+        }
+        SEL imgSel = sel_registerName("imageForImageDescriptor:");
+        Class imgCls = dv_classImplementingSelector(clsISIconBase, imgSel);
+        if (imgCls) {
+            dv_swizzle(imgCls, imgSel, (IMP)swizzled_isicon_imageForDescriptor, &s_orig_isicon_imageForDescriptor);
+        }
+    }
+
     // Dock tile & appearance chiclet neutralization
     Class clsTileLayer = objc_getClass("DOCKTileLayer");
     if (clsTileLayer) {
         dv_swizzle(clsTileLayer, sel_registerName("_requiresGlassBackground"), (IMP)swizzled_iconStack_returnNo, NULL);
+        dv_swizzle(clsTileLayer, sel_registerName("setGlassBackgroundStyle:"), (IMP)swizzled_tileLayer_setGlassBgStyle, &s_orig_tileLayer_setGlassBgStyle);
+        dv_swizzle(clsTileLayer, sel_registerName("_setReplacementAppImage:preferredGlassBackgroundStyle:"),
+                   (IMP)swizzled_tileLayer_setReplacementAppImage, &s_orig_tileLayer_setReplacementAppImage);
     }
     Class clsIconAppearance = objc_getClass("IconAppearance");
     if (clsIconAppearance) {
+        dv_swizzle(clsIconAppearance, sel_registerName("style"), (IMP)swizzled_iconAppearance_style, &s_orig_iconAppearance_style);
+        dv_swizzle(clsIconAppearance, sel_registerName("iconDescription"), (IMP)swizzled_iconAppearance_iconDesc, &s_orig_iconAppearance_iconDesc);
+        dv_swizzle(clsIconAppearance, sel_registerName("mitigatedIconDescription"), (IMP)swizzled_iconAppearance_mitigatedDesc, &s_orig_iconAppearance_mitigatedDesc);
         dv_swizzle(clsIconAppearance, sel_registerName("requiresGlassBackground"), (IMP)swizzled_iconStack_returnNo, NULL);
         dv_swizzle(clsIconAppearance, sel_registerName("requiresDarkGlassBackground"), (IMP)swizzled_iconStack_returnNo, NULL);
     }

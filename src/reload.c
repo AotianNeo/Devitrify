@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <objc/runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,8 +55,64 @@ static void move_to_trash_or_unlink(const char *src, const char *filename) {
     unlink(src);
 }
 
-static void purge_icon_cache_to_trash(void) {
+@interface NSObject (DVReloadIconWarmup)
+- (id)initWithURL:(NSURL *)url;
+- (id)initWithSize:(CGSize)size scale:(double)scale;
+- (void)setIgnoreCache:(BOOL)ignore;
+- (void)prepareImagesForImageDescriptors:(NSArray *)descs;
+- (id)imageForImageDescriptor:(id)desc;
+@end
+
+static void warmup_iconservicesagent_synchronously(void) {
+    @autoreleasepool {
+        dlopen("/System/Library/PrivateFrameworks/IconServices.framework/Versions/A/IconServices", RTLD_LAZY | RTLD_GLOBAL);
+        Class clsISIcon = objc_getClass("ISIcon");
+        Class clsISDesc = objc_getClass("ISImageDescriptor");
+        if (!clsISIcon || !clsISDesc) return;
+
+        id desc = [[clsISDesc alloc] initWithSize:CGSizeMake(128, 128) scale:2.0];
+        if (!desc) return;
+        if ([desc respondsToSelector:@selector(setIgnoreCache:)]) {
+            [desc setIgnoreCache:YES];
+        }
+
+        NSArray<NSString *> *paths = @[
+            @"/System/Library/CoreServices/Finder.app",
+            @"/Applications/Safari.app"
+        ];
+        for (NSString *p in paths) {
+            if (access(p.UTF8String, F_OK) != 0) continue;
+            id icon = [[clsISIcon alloc] initWithURL:[NSURL fileURLWithPath:p]];
+            if (icon && [icon respondsToSelector:@selector(prepareImagesForImageDescriptors:)]) {
+                [icon prepareImagesForImageDescriptors:@[desc]];
+                if ([icon respondsToSelector:@selector(imageForImageDescriptor:)]) {
+                    (void)[icon imageForImageDescriptor:desc];
+                }
+            }
+        }
+    }
+}
+
+static void restart_iconservicesagent_only(void) {
+    char cmd[512];
+    uid_t uid = getuid();
+    snprintf(cmd, sizeof(cmd),
+        "/bin/launchctl bootout gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null; "
+        "/bin/launchctl bootstrap gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null",
+        (unsigned)uid, (unsigned)uid);
+    (void)system(cmd);
+    warmup_iconservicesagent_synchronously();
+}
+
+static void purge_and_refresh_icons(void) {
+    uid_t uid = getuid();
+    char stop_cmd[256];
+    snprintf(stop_cmd, sizeof(stop_cmd),
+        "/bin/launchctl bootout gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null",
+        (unsigned)uid);
+    (void)system(stop_cmd);
     (void)system("/usr/bin/killall -9 DockHelper Launchpad 2>/dev/null");
+
     char cache_dir[PATH_MAX];
     if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache_dir, sizeof(cache_dir)) > 0) {
         const char *targets[] = { "com.apple.iconservices", "com.apple.iconservicesagent", NULL };
@@ -84,22 +141,16 @@ static void purge_icon_cache_to_trash(void) {
             (void)system(sql_cmd);
         }
     }
-}
 
-static void restart_iconservicesagent_only(void) {
-    char cmd[512];
-    uid_t uid = getuid();
-    snprintf(cmd, sizeof(cmd),
-        "/bin/launchctl bootout gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null; "
+    char start_cmd[256];
+    snprintf(start_cmd, sizeof(start_cmd),
         "/bin/launchctl bootstrap gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null",
-        (unsigned)uid, (unsigned)uid);
-    (void)system(cmd);
-}
+        (unsigned)uid);
+    (void)system(start_cmd);
 
-static void restart_iconservicesagent_if_needed(void) {
-    restart_iconservicesagent_only();
+    // Synchronously warm up iconservicesagent so it is alive and hooked before Dock/Finder restart.
+    warmup_iconservicesagent_synchronously();
 
-    char cache_dir[PATH_MAX];
     if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache_dir, sizeof(cache_dir)) > 0) {
         char p[PATH_MAX];
         snprintf(p, sizeof(p), "%scom.apple.dock.iconcache", cache_dir);
@@ -161,19 +212,6 @@ static int inspect_process_images(pid_t pid, int *out_has_appkit, int *out_has_d
 
     mach_port_t task = MACH_PORT_NULL;
     if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "vmmap -pages %d 2>/dev/null", pid);
-        FILE *fp = popen(cmd, "r");
-        if (fp) {
-            char line[1024];
-            while (fgets(line, sizeof(line), fp)) {
-                if (out_has_appkit && !*out_has_appkit && strstr(line, "AppKit")) *out_has_appkit = 1;
-                if (out_has_devitrify && !*out_has_devitrify && strstr(line, "Devitrify")) *out_has_devitrify = 1;
-                if (*out_has_appkit && *out_has_devitrify) break;
-            }
-            pclose(fp);
-            return (*out_has_appkit != 0);
-        }
         return 0;
     }
 
@@ -281,9 +319,7 @@ static const uint32_t s_inject_code[] = {
 static int inject_dylib_into_pid(pid_t pid, const char *dylib_path) {
     mach_port_t task = MACH_PORT_NULL;
     if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd), "lldb -p %d --batch -o 'expr -l objc++ -- (void*)dlopen(\"%s\", 2)' >/dev/null 2>&1", pid, dylib_path);
-        return (system(cmd) == 0);
+        return 0;
     }
 
     mach_vm_address_t remote_page = 0, remote_stack = 0;
@@ -410,11 +446,9 @@ static void scan_or_inject_running_apps(const char *dylib_path, int do_inject, i
 
             NSString *bundlePath = app.bundleURL.path;
             BOOL isApp = bundlePath && [bundlePath hasSuffix:@".app"] && [bundlePath rangeOfString:@".app/Contents/"].location == NSNotFound;
-            BOOL isAppEx = bundlePath && [bundlePath hasSuffix:@".appex"];
-            BOOL isXPC = bundlePath && [bundlePath hasSuffix:@".xpc"];
-            if (!isApp && !isAppEx && !isXPC) continue;
+            if (!isApp) continue;
 
-            if (!isAppEx && !isXPC && app.activationPolicy == NSApplicationActivationPolicyProhibited) continue;
+            if (app.activationPolicy == NSApplicationActivationPolicyProhibited) continue;
 
             NSString *bid = app.bundleIdentifier ?: @"";
             if ([bid isEqualToString:@"com.apple.loginwindow"] ||
@@ -512,8 +546,7 @@ int main(int argc, char **argv) {
             close(fd);
         }
         printf("[Devitrify Hot-Reload] 🛑 System-wide disable marker set (%s).\n", DISABLED_FILE);
-        purge_icon_cache_to_trash();
-        restart_iconservicesagent_if_needed();
+        purge_and_refresh_icons();
     } else if (mode_enable) {
         if (access(DISABLED_FILE, F_OK) == 0) {
             move_to_trash_or_unlink(DISABLED_FILE, "devitrify-disabled");
@@ -571,11 +604,11 @@ int main(int argc, char **argv) {
     if (!is_currently_disabled) {
         int injected = 0, uninjected = 0;
         scan_or_inject_running_apps(new_dylib_path, 1, &injected, &uninjected);
+        (void)system("/usr/bin/killall LocalAuthenticationRemoteService 2>/dev/null");
         if (mode_login) {
             restart_iconservicesagent_only();
         } else {
-            purge_icon_cache_to_trash();
-            restart_iconservicesagent_if_needed();
+            purge_and_refresh_icons();
         }
     }
 

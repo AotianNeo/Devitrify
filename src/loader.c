@@ -4,6 +4,7 @@
 // into processes that already have AppKit loaded, i.e. apps.
 
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
@@ -107,11 +108,18 @@ extern bool _os_feature_enabled_impl(const char *domain, const char *feature);
 // and the subsequent Semantics.v7 dyld_program_sdk_at_least check returns false.
 static volatile int s_in_solarium_compute_values = 0;
 
-static bool devitrify_caller_is_swift_feature_flags(const void *address) {
-    Dl_info info;
-    if (!dladdr(address, &info) || !info.dli_fname) return false;
-    return strstr(info.dli_fname, "/SwiftUICore.framework/") != NULL ||
-           strstr(info.dli_fname, "FeatureFlags") != NULL;
+static bool devitrify_caller_is_swiftuicore(void) {
+    void *bt[6];
+    int n = backtrace(bt, 6);
+    for (int i = 1; i < n; i++) {
+        Dl_info info;
+        if (dladdr(bt[i], &info) && info.dli_fname) {
+            if (strstr(info.dli_fname, "/SwiftUICore.framework/") != NULL) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 static bool devitrify_feature_enabled(const char *domain, const char *feature) {
@@ -120,12 +128,13 @@ static bool devitrify_feature_enabled(const char *domain, const char *feature) {
     }
     if (domain && feature) {
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "flexiGlassMacOS")) return true;
+        if (!strcmp(domain, "IconServices") && !strcmp(feature, "SolariumCornerRadius")) return false;
         if (!strcmp(domain, "SwiftUI") && !strcmp(feature, "Solarium")) {
-            const void *ret = __builtin_return_address(0);
-            if (s_appkit_loaded && devitrify_caller_is_swift_feature_flags(ret)) {
+            if (s_appkit_loaded && devitrify_caller_is_swiftuicore()) {
                 s_in_solarium_compute_values = 1;
                 return true;
             }
+            return false;
         }
     }
     return _os_feature_enabled_impl(domain, feature);
