@@ -104,7 +104,8 @@ static void detect_loaded_frameworks(void) {
         return;
     }
 
-    int is_iconservices_agent = (strstr(executable, "/iconservicesagent") != NULL);
+    int is_iconservices_target = (strstr(executable, "/iconservicesagent") != NULL ||
+                                  strstr(executable, "/Dock.app/Contents/MacOS/Dock") != NULL);
 
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
@@ -113,10 +114,10 @@ static void detect_loaded_frameworks(void) {
             if (strstr(name, "/AppKit.framework/")) {
                 s_appkit_loaded = 1;
             }
-            if (is_iconservices_agent && strstr(name, "/IconServices.framework/")) {
+            if (is_iconservices_target && strstr(name, "/IconServices.framework/")) {
                 s_iconservices_loaded = 1;
             }
-            if (s_appkit_loaded && (!is_iconservices_agent || s_iconservices_loaded)) break;
+            if (s_appkit_loaded && (!is_iconservices_target || s_iconservices_loaded)) break;
         }
     }
 }

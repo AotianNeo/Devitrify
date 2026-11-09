@@ -2014,6 +2014,34 @@ static void dv_sampleSquircleCornerPoints(CGImageRef cg, int *outTransparentCoun
     }
 }
 
+static IMP s_orig_tileLayer_setImageSDF = NULL;
+static void swizzled_tileLayer_setImageSDF(id self, SEL _cmd, CGImageRef img, NSUInteger style, id sdf) {
+    if (!s_core_hooks_disabled) {
+        style = 0;
+        if (img && [self respondsToSelector:@selector(imageLayer)]) {
+            CALayer *imgLayer = [self imageLayer];
+            CGImageRef cur = (__bridge CGImageRef)[imgLayer contents];
+            if (cur) {
+                int newTrans = 0, newWhite = 0, curTrans = 0, curWhite = 0;
+                dv_sampleSquircleCornerPoints(img, &newTrans, &newWhite);
+                dv_sampleSquircleCornerPoints(cur, &curTrans, &curWhite);
+                // If a running app (e.g. Chrome) pushed a white-squircle .icns replacement image
+                // at Dock startup before IconServices finished rendering the unjailed Type A icon,
+                // clear the replacement app image so the unjailed Type A icon takes effect.
+                if (newTrans >= 3 && curWhite >= 3) {
+                    SEL remSel = sel_registerName("_removeReplacementAppImage");
+                    if ([self respondsToSelector:remSel]) {
+                        ((void (*)(id, SEL))objc_msgSend)(self, remSel);
+                    }
+                }
+            }
+        }
+    }
+    if (s_orig_tileLayer_setImageSDF) {
+        ((void (*)(id, SEL, CGImageRef, NSUInteger, id))s_orig_tileLayer_setImageSDF)(self, _cmd, img, style, sdf);
+    }
+}
+
 static IMP s_orig_tileLayer_setReplacementAppImage = NULL;
 static void swizzled_tileLayer_setReplacementAppImage(id self, SEL _cmd, CGImageRef img, NSUInteger style) {
     if (!s_core_hooks_disabled) {
@@ -2130,6 +2158,8 @@ static void dv_installIconJailNeutralization(void) {
     if (clsTileLayer) {
         dv_swizzle(clsTileLayer, sel_registerName("_requiresGlassBackground"), (IMP)swizzled_iconStack_returnNo, NULL);
         dv_swizzle(clsTileLayer, sel_registerName("setGlassBackgroundStyle:"), (IMP)swizzled_tileLayer_setGlassBgStyle, &s_orig_tileLayer_setGlassBgStyle);
+        dv_swizzle(clsTileLayer, sel_registerName("_setImage:preferredGlassBackgroundStyle:SDFElementContents:"),
+                   (IMP)swizzled_tileLayer_setImageSDF, &s_orig_tileLayer_setImageSDF);
         dv_swizzle(clsTileLayer, sel_registerName("_setReplacementAppImage:preferredGlassBackgroundStyle:"),
                    (IMP)swizzled_tileLayer_setReplacementAppImage, &s_orig_tileLayer_setReplacementAppImage);
     }
