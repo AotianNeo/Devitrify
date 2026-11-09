@@ -81,7 +81,31 @@ void devitrify_set_system_disabled(int disabled) {
     s_system_disabled = disabled ? 1 : 0;
 }
 
+static int is_headless_daemon_or_helper_path(const char *exe) {
+    if (!exe || !exe[0]) return 0;
+    if (strstr(exe, "/usr/libexec/") != NULL) return 1;
+    if (strstr(exe, "/Helpers/chrome_crashpad_handler") != NULL) return 1;
+    if (strstr(exe, "/Helpers/Google Chrome Helper") != NULL) return 1;
+    if (strstr(exe, "/Support/photolibraryd") != NULL) return 1;
+    if (strstr(exe, "/PassKitCore.framework/passd") != NULL) return 1;
+    if (strstr(exe, "/People.framework/peopled") != NULL) return 1;
+    if (strstr(exe, "/CoreServices/diagnostics_agent") != NULL) return 1;
+    return 0;
+}
+
 static void detect_loaded_frameworks(void) {
+    char executable[PATH_MAX] = {0};
+    uint32_t size = sizeof(executable);
+    _NSGetExecutablePath(executable, &size);
+
+    if (is_headless_daemon_or_helper_path(executable)) {
+        s_appkit_loaded = 0;
+        s_iconservices_loaded = 0;
+        return;
+    }
+
+    int is_iconservices_agent = (strstr(executable, "/iconservicesagent") != NULL);
+
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
@@ -89,10 +113,10 @@ static void detect_loaded_frameworks(void) {
             if (strstr(name, "/AppKit.framework/")) {
                 s_appkit_loaded = 1;
             }
-            if (strstr(name, "/IconServices.framework/")) {
+            if (is_iconservices_agent && strstr(name, "/IconServices.framework/")) {
                 s_iconservices_loaded = 1;
             }
-            if (s_appkit_loaded && s_iconservices_loaded) break;
+            if (s_appkit_loaded && (!is_iconservices_agent || s_iconservices_loaded)) break;
         }
     }
 }
@@ -177,54 +201,18 @@ static bool devitrify_program_sdk_at_least(devitrify_build_version version) {
 
 DYLD_INTERPOSE(devitrify_program_sdk_at_least, dyld_program_sdk_at_least);
 
-// Crash-guard for dlopen(DevitrifyCore): if loading or initializing hooks triggers SIGSEGV/SIGBUS/SIGILL/SIGABRT,
-// record a per-process bypass marker and longjmp back so the host app continues running cleanly without hooks.
-static sigjmp_buf s_load_jmp_buf;
-static volatile sig_atomic_t s_load_guard_active = 0;
-
-static void devitrify_load_signal_handler(int sig) {
-    if (s_load_guard_active) {
-        s_load_guard_active = 0;
-        s_process_bypassed = 1;
-        mkdir(DEVITRIFY_BYPASS_DIR, 0755);
-        const char *marker = devitrify_process_bypass_marker_path();
-        if (marker) {
-            int fd = open(marker, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-            if (fd >= 0) {
-                char msg[64];
-                int len = snprintf(msg, sizeof(msg), "signal=%d\n", sig);
-                if (len > 0) (void)write(fd, msg, (size_t)len);
-                close(fd);
-            }
-        }
-        siglongjmp(s_load_jmp_buf, sig);
-    }
-}
-
+// Load DevitrifyCore after verifying the backing file is present and non-empty.
+// Do NOT wrap dlopen() itself in sigsetjmp/siglongjmp: jumping out across dlopen()
+// skips dyld's C++ RuntimeLocks destructor and leaves dyld's global ulock permanently
+// held by the current thread. DevitrifyCore's own constructor wraps hook installation
+// in dv_runFaultTolerant inside the initializer frame so dyld always releases its lock.
 static void safe_dlopen_core(const char *dylib_path) {
-    struct sigaction sa_new, sa_old_segv, sa_old_bus, sa_old_ill, sa_old_trap, sa_old_abrt;
-    memset(&sa_new, 0, sizeof(sa_new));
-    sa_new.sa_handler = devitrify_load_signal_handler;
-    sigemptyset(&sa_new.sa_mask);
-    sa_new.sa_flags = 0;
-
-    sigaction(SIGSEGV, &sa_new, &sa_old_segv);
-    sigaction(SIGBUS,  &sa_new, &sa_old_bus);
-    sigaction(SIGILL,  &sa_new, &sa_old_ill);
-    sigaction(SIGTRAP, &sa_new, &sa_old_trap);
-    sigaction(SIGABRT, &sa_new, &sa_old_abrt);
-
-    s_load_guard_active = 1;
-    if (sigsetjmp(s_load_jmp_buf, 1) == 0) {
-        dlopen(dylib_path, RTLD_NOW | RTLD_LOCAL);
+    if (!dylib_path || !dylib_path[0]) return;
+    struct stat st;
+    if (stat(dylib_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        return;
     }
-    s_load_guard_active = 0;
-
-    sigaction(SIGSEGV, &sa_old_segv, NULL);
-    sigaction(SIGBUS,  &sa_old_bus,  NULL);
-    sigaction(SIGILL,  &sa_old_ill,  NULL);
-    sigaction(SIGTRAP, &sa_old_trap, NULL);
-    sigaction(SIGABRT, &sa_old_abrt, NULL);
+    dlopen(dylib_path, RTLD_NOW | RTLD_LOCAL);
 }
 
 __attribute__((constructor))

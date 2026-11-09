@@ -12,6 +12,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
 #import <sys/sysctl.h>
+#import <sys/stat.h>
 #import <ImageIO/ImageIO.h>
 #if __has_feature(ptrauth_calls)
 #import <ptrauth.h>
@@ -1218,9 +1219,15 @@ static void dv_performHotReload(void) {
     if (!currentPath || currentPath.length == 0) {
         currentPath = DEVITRIFY_CORE_PATH;
     }
-    dv_runFaultTolerant(^{
-        dlopen(currentPath.UTF8String, RTLD_NOW | RTLD_LOCAL);
-    });
+    const char *cpath = currentPath.UTF8String;
+    if (!cpath || !cpath[0]) return;
+    struct stat st;
+    if (stat(cpath, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        return;
+    }
+    // Never wrap dlopen() in sigsetjmp/siglongjmp: jumping out across dlopen()
+    // skips dyld's RuntimeLocks release and deadlocks dyld's ulock permanently.
+    dlopen(cpath, RTLD_NOW | RTLD_LOCAL);
 }
 
 #pragma mark - macOS 26 Icon Jail Neutralization
@@ -1911,7 +1918,7 @@ static void swizzled_tileLayer_setReplacementAppImage(id self, SEL _cmd, CGImage
     }
 }
 
-static void dv_installIconJailNeutralization(void) {
+static void dv_preloadIconFrameworksIfNeeded(void) {
     if (objc_getClass("ISRecordResourceProvider") == Nil) {
         dlopen("/System/Library/PrivateFrameworks/IconServices.framework/Versions/A/IconServices", RTLD_LAZY | RTLD_GLOBAL);
     }
@@ -1924,7 +1931,9 @@ static void dv_installIconJailNeutralization(void) {
     if (objc_getClass("CUICatalog") == Nil) {
         dlopen("/System/Library/PrivateFrameworks/CoreUI.framework/Versions/A/CoreUI", RTLD_LAZY | RTLD_GLOBAL);
     }
+}
 
+static void dv_installIconJailNeutralization(void) {
     Class clsLayerStack = objc_getClass("CUINamedIconLayerStack");
     if (clsLayerStack) {
         dv_swizzle(clsLayerStack, sel_registerName("finalizedIconWithDescriptor:error:"), (IMP)swizzled_finalizedIconWithDescriptor, &s_orig_finalizedIconWithDescriptor);
@@ -2010,8 +2019,27 @@ static void dv_installHotReloadListenerIfNeeded(void) {
 
 #pragma mark - Constructor
 
+static BOOL dv_isHeadlessDaemonOrHelper(void) {
+    NSString *exe = NSBundle.mainBundle.executablePath ?: NSProcessInfo.processInfo.arguments.firstObject;
+    if (!exe.length) return NO;
+    if ([exe containsString:@"/usr/libexec/"]) return YES;
+    if ([exe containsString:@"/Helpers/chrome_crashpad_handler"]) return YES;
+    if ([exe containsString:@"/Helpers/Google Chrome Helper"]) return YES;
+    if ([exe containsString:@"/Support/photolibraryd"]) return YES;
+    if ([exe containsString:@"/PassKitCore.framework/passd"]) return YES;
+    if ([exe containsString:@"/People.framework/peopled"]) return YES;
+    if ([exe containsString:@"/CoreServices/diagnostics_agent"]) return YES;
+    return NO;
+}
+
 static void dv_runInitOnMainThread(void) {
     @autoreleasepool {
+        if (dv_isHeadlessDaemonOrHelper()) {
+            dv_setLoaderSystemDisabled(YES);
+            dv_restoreAllSwizzlesAndPatches();
+            return;
+        }
+
         dv_installHotReloadListenerIfNeeded();
 
         BOOL isSafeBoot = dv_isSafeBoot();
@@ -2031,6 +2059,8 @@ static void dv_runInitOnMainThread(void) {
             }
             return;
         }
+
+        dv_preloadIconFrameworksIfNeeded();
 
         dv_runFaultTolerant(^{
             dv_restoreAllSwizzlesAndPatches();
