@@ -1285,13 +1285,14 @@ static id swizzled_composite_imageForSize_scale(id self, SEL _cmd, CGSize size, 
 - (id)imageLayer;
 @end
 
-static const void *kDVStackRefKey      = &kDVStackRefKey;
-static const void *kDVDescRefKey       = &kDVDescRefKey;
-static const void *kDVForceKeepKey     = &kDVForceKeepKey;
-static const void *kDVStackDecisionKey = &kDVStackDecisionKey;
-static const void *kDVStackScaleKey    = &kDVStackScaleKey;
-static const void *kDVStackCenterXKey  = &kDVStackCenterXKey;
-static const void *kDVStackCenterYKey  = &kDVStackCenterYKey;
+static const void *kDVStackRefKey        = &kDVStackRefKey;
+static const void *kDVDescRefKey         = &kDVDescRefKey;
+static const void *kDVForceKeepKey       = &kDVForceKeepKey;
+static const void *kDVTargetPixelSizeKey = &kDVTargetPixelSizeKey;
+static const void *kDVStackDecisionKey   = &kDVStackDecisionKey;
+static const void *kDVStackScaleKey      = &kDVStackScaleKey;
+static const void *kDVStackCenterXKey    = &kDVStackCenterXKey;
+static const void *kDVStackCenterYKey    = &kDVStackCenterYKey;
 
 // Evaluates whether a layered icon rendered without its background plate (0x888ULL)
 // is a complete, centered standalone object (Type A -> strip squircle background & scale up to standard icon size)
@@ -1386,41 +1387,21 @@ static BOOL dv_shouldStripLayeredIconCGImage(CGImageRef cg, double *outScale, do
     return YES;
 }
 
-static CGImageRef dv_scaleTypeACGImage(CGImageRef cg, double scale, double cx, double cy) {
-    if (!cg || scale <= 1.01) return cg;
-    size_t w = CGImageGetWidth(cg);
-    size_t h = CGImageGetHeight(cg);
-    if (w < 8 || h < 8) return cg;
+static CGImageRef dv_cropScaledTypeACGImage(CGImageRef cgScaled, size_t targetW, size_t targetH, double cx, double cy) {
+    if (!cgScaled || targetW < 8 || targetH < 8) return cgScaled;
+    size_t scaledW = CGImageGetWidth(cgScaled);
+    size_t scaledH = CGImageGetHeight(cgScaled);
+    if (scaledW <= targetW || scaledH <= targetH) return cgScaled;
 
-    CGColorSpaceRef cs = CGImageGetColorSpace(cg);
-    CGColorSpaceRef fallbackCS = NULL;
-    if (!cs) {
-        fallbackCS = CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB);
-        cs = fallbackCS;
-    }
-    CGContextRef ctx = CGBitmapContextCreate(
-        NULL, w, h,
-        CGImageGetBitsPerComponent(cg), 0,
-        cs, CGImageGetBitmapInfo(cg));
-    if (!ctx) {
-        if (!fallbackCS) fallbackCS = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
-        ctx = CGBitmapContextCreate(NULL, w, h, 8, w * 4, fallbackCS, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
-    }
-    if (fallbackCS) CGColorSpaceRelease(fallbackCS);
-    if (!ctx) return cg;
+    long cropX = lrint(cx * (double)scaledW - (double)targetW * 0.5);
+    long cropY = lrint(cy * (double)scaledH - (double)targetH * 0.5);
+    if (cropX < 0) cropX = 0;
+    if (cropY < 0) cropY = 0;
+    if ((size_t)cropX + targetW > scaledW) cropX = (long)(scaledW - targetW);
+    if ((size_t)cropY + targetH > scaledH) cropY = (long)(scaledH - targetH);
 
-    double drawW = (double)w * scale;
-    double drawH = (double)h * scale;
-    double cgCx  = cx * (double)w;
-    double cgCy  = (1.0 - cy) * (double)h;
-    double originX = (double)w * 0.5 - cgCx * scale;
-    double originY = (double)h * 0.5 - cgCy * scale;
-
-    CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
-    CGContextDrawImage(ctx, CGRectMake(originX, originY, drawW, drawH), cg);
-    CGImageRef out = CGBitmapContextCreateImage(ctx);
-    CGContextRelease(ctx);
-    if (!out) return cg;
+    CGImageRef out = CGImageCreateWithImageInRect(cgScaled, CGRectMake((CGFloat)cropX, (CGFloat)cropY, (CGFloat)targetW, (CGFloat)targetH));
+    if (!out) return cgScaled;
     return (CGImageRef)CFAutorelease(out);
 }
 
@@ -1455,17 +1436,24 @@ static id swizzled_multisized_imageForSize_scale(id self, SEL _cmd, CGSize size,
                         size_t targetW = (size_t)lrint(size.width * scale);
                         size_t targetH = (size_t)lrint(size.height * scale);
                         if (targetW > 0 && targetH > 0 && (CGImageGetWidth(cg) != targetW || CGImageGetHeight(cg) != targetH)) {
-                            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                            CGColorSpaceRef cs = CGImageGetColorSpace(cg);
+                            CGColorSpaceRef fallbackCS = NULL;
+                            if (!cs || CGColorSpaceGetModel(cs) != kCGColorSpaceModelRGB) {
+                                fallbackCS = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
+                                cs = fallbackCS;
+                            }
                             CGContextRef ctx = CGBitmapContextCreate(NULL, targetW, targetH, 8, targetW * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
-                            CGColorSpaceRelease(cs);
-                            CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
-                            CGContextDrawImage(ctx, CGRectMake(0, 0, targetW, targetH), cg);
-                            CGImageRef scaled = CGBitmapContextCreateImage(ctx);
-                            CGContextRelease(ctx);
-                            if (scaled) {
-                                id img = [[clsIFImage alloc] initWithCGImage:scaled scale:scale];
-                                CGImageRelease(scaled);
-                                return img;
+                            if (fallbackCS) CGColorSpaceRelease(fallbackCS);
+                            if (ctx) {
+                                CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+                                CGContextDrawImage(ctx, CGRectMake(0, 0, targetW, targetH), cg);
+                                CGImageRef scaled = CGBitmapContextCreateImage(ctx);
+                                CGContextRelease(ctx);
+                                if (scaled) {
+                                    id img = [[clsIFImage alloc] initWithCGImage:scaled scale:scale];
+                                    CGImageRelease(scaled);
+                                    return img;
+                                }
                             }
                         }
                         return [[clsIFImage alloc] initWithCGImage:cg scale:scale];
@@ -1503,15 +1491,47 @@ static id swizzled_finalizedIconWithDescriptor(id self, SEL _cmd, id desc, NSErr
     if (desc && [desc respondsToSelector:@selector(setForceClearBackground:)]) {
         [desc setForceClearBackground:shouldClear];
     }
+
+    // When this layer stack is a known Type A icon with scale > 1.01, finalize directly at the
+    // scaled native resolution so CoreUI/IconRendering rasterizes the 1024px/SVG layers once
+    // at full target detail, avoiding any post-rasterization bitmap upscaling.
+    if (shouldClear && cachedDecision != nil && desc &&
+        [desc respondsToSelector:@selector(size)] &&
+        [desc respondsToSelector:@selector(setSize:)] &&
+        [desc respondsToSelector:@selector(scale)]) {
+        double scale = [objc_getAssociatedObject(self, kDVStackScaleKey) doubleValue];
+        if (scale > 1.01) {
+            CGSize origSize = ((CGSize (*)(id, SEL))objc_msgSend)(desc, @selector(size));
+            NSInteger descScale = ((NSInteger (*)(id, SEL))objc_msgSend)(desc, @selector(scale));
+            if (descScale < 1) descScale = 1;
+            size_t targetW = (size_t)lrint(origSize.width * (double)descScale);
+            size_t targetH = (size_t)lrint(origSize.height * (double)descScale);
+            if (targetW >= 8 && targetH >= 8) {
+                size_t scaledW = (size_t)lrint((double)targetW * scale);
+                size_t scaledH = (size_t)lrint((double)targetH * scale);
+                CGSize scaledPtSize = CGSizeMake((double)scaledW / (double)descScale,
+                                                 (double)scaledH / (double)descScale);
+                ((void (*)(id, SEL, CGSize))objc_msgSend)(desc, @selector(setSize:), scaledPtSize);
+                id fin = ((id(*)(id, SEL, id, NSError **))s_orig_finalizedIconWithDescriptor)(self, _cmd, desc, error);
+                ((void (*)(id, SEL, CGSize))objc_msgSend)(desc, @selector(setSize:), origSize);
+                if (fin) {
+                    objc_setAssociatedObject(fin, kDVStackRefKey, self, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    objc_setAssociatedObject(fin, kDVTargetPixelSizeKey,
+                                             [NSValue valueWithSize:NSMakeSize((CGFloat)targetW, (CGFloat)targetH)],
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                return fin;
+            }
+        }
+    }
+
     id fin = ((id(*)(id, SEL, id, NSError **))s_orig_finalizedIconWithDescriptor)(self, _cmd, desc, error);
     if (fin) {
         if (!shouldClear) {
             objc_setAssociatedObject(fin, kDVForceKeepKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         } else {
             objc_setAssociatedObject(fin, kDVStackRefKey, self, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            if (cachedDecision == nil) {
-                objc_setAssociatedObject(fin, kDVDescRefKey, desc, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            }
+            objc_setAssociatedObject(fin, kDVDescRefKey, desc, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
     return fin;
@@ -1547,6 +1567,46 @@ static inline CGImageRef dv_invokeSysGlassWithSteps(id fin, SEL sysGlassSel, IMP
     return cg;
 }
 
+static CGImageRef dv_renderFinalizedIconAtNativeScale(id stack, id desc, SEL sysGlassSel, IMP sysGlassImp, id cfg,
+                                                      CGImageRef fallbackCG, double scale, double cx, double cy) {
+    if (!stack || !desc || !s_orig_finalizedIconWithDescriptor || !fallbackCG || scale <= 1.01) {
+        return fallbackCG;
+    }
+    if (![desc respondsToSelector:@selector(size)] ||
+        ![desc respondsToSelector:@selector(setSize:)] ||
+        ![desc respondsToSelector:@selector(scale)]) {
+        return fallbackCG;
+    }
+    size_t targetW = CGImageGetWidth(fallbackCG);
+    size_t targetH = CGImageGetHeight(fallbackCG);
+    if (targetW < 8 || targetH < 8) return fallbackCG;
+
+    CGSize origSize = ((CGSize (*)(id, SEL))objc_msgSend)(desc, @selector(size));
+    NSInteger descScale = ((NSInteger (*)(id, SEL))objc_msgSend)(desc, @selector(scale));
+    if (descScale < 1) descScale = 1;
+
+    size_t scaledW = (size_t)lrint((double)targetW * scale);
+    size_t scaledH = (size_t)lrint((double)targetH * scale);
+    CGSize scaledPtSize = CGSizeMake((double)scaledW / (double)descScale,
+                                     (double)scaledH / (double)descScale);
+
+    if ([desc respondsToSelector:@selector(setForceClearBackground:)]) {
+        [desc setForceClearBackground:YES];
+    }
+    ((void (*)(id, SEL, CGSize))objc_msgSend)(desc, @selector(setSize:), scaledPtSize);
+    id finScaled = ((id(*)(id, SEL, id, NSError **))s_orig_finalizedIconWithDescriptor)(
+        stack, sel_registerName("finalizedIconWithDescriptor:error:"), desc, NULL);
+    ((void (*)(id, SEL, CGSize))objc_msgSend)(desc, @selector(setSize:), origSize);
+    if (!finScaled) {
+        return fallbackCG;
+    }
+    CGImageRef cgScaled = dv_invokeSysGlassWithSteps(finScaled, sysGlassSel, sysGlassImp, cfg, 0x888ULL);
+    if (!cgScaled) {
+        return fallbackCG;
+    }
+    return dv_cropScaledTypeACGImage(cgScaled, targetW, targetH, cx, cy);
+}
+
 static CGImageRef dv_renderFinalizedIcon(id fin, SEL fallbackSel, IMP fallbackImp, id cfg) {
     IMP sysGlassImp = s_orig_renderedSystemGlassIcon ?: fallbackImp;
     SEL sysGlassSel = s_orig_renderedSystemGlassIcon
@@ -1559,32 +1619,70 @@ static CGImageRef dv_renderFinalizedIcon(id fin, SEL fallbackSel, IMP fallbackIm
         return dv_invokeSysGlassWithSteps(fin, sysGlassSel, sysGlassImp, cfg, 0x889ULL);
     }
 
-    CGImageRef cgClear = dv_invokeSysGlassWithSteps(fin, sysGlassSel, sysGlassImp, cfg, 0x888ULL);
-
     id stack = objc_getAssociatedObject(fin, kDVStackRefKey);
-    id desc  = objc_getAssociatedObject(fin, kDVDescRefKey);
+    NSValue *targetSizeVal = objc_getAssociatedObject(fin, kDVTargetPixelSizeKey);
+    if (stack && targetSizeVal) {
+        CGImageRef cgScaled = dv_invokeSysGlassWithSteps(fin, sysGlassSel, sysGlassImp, cfg, 0x888ULL);
+        NSSize tsz = [targetSizeVal sizeValue];
+        double cx = [objc_getAssociatedObject(stack, kDVStackCenterXKey) doubleValue];
+        double cy = [objc_getAssociatedObject(stack, kDVStackCenterYKey) doubleValue];
+        return dv_cropScaledTypeACGImage(cgScaled, (size_t)lrint(tsz.width), (size_t)lrint(tsz.height), cx, cy);
+    }
+
+    CGImageRef cgClear = dv_invokeSysGlassWithSteps(fin, sysGlassSel, sysGlassImp, cfg, 0x888ULL);
     if (!stack) {
         return cgClear;
     }
-    if (!desc || !s_orig_finalizedIconWithDescriptor) {
-        NSNumber *scaleNum = objc_getAssociatedObject(stack, kDVStackScaleKey);
-        if (scaleNum) {
-            double scale = scaleNum.doubleValue;
+
+    id desc = objc_getAssociatedObject(fin, kDVDescRefKey);
+    NSNumber *cachedDecision = objc_getAssociatedObject(stack, kDVStackDecisionKey);
+    if (cachedDecision != nil) {
+        if (cachedDecision.boolValue) {
+            double scale = [objc_getAssociatedObject(stack, kDVStackScaleKey) doubleValue];
             double cx = [objc_getAssociatedObject(stack, kDVStackCenterXKey) doubleValue];
             double cy = [objc_getAssociatedObject(stack, kDVStackCenterYKey) doubleValue];
-            return dv_scaleTypeACGImage(cgClear, scale, cx, cy);
+            return dv_renderFinalizedIconAtNativeScale(stack, desc, sysGlassSel, sysGlassImp, cfg, cgClear, scale, cx, cy);
         }
         return cgClear;
     }
 
+    if (!desc || !s_orig_finalizedIconWithDescriptor) {
+        return cgClear;
+    }
+
+    // Always probe Type A classification on at least a 128x128 rasterization so small initial
+    // requests (e.g. 16x16@2x in Finder list view) do not introduce bounding-box quantization error.
+    CGImageRef cgProbe = cgClear;
+    if (cgClear && (CGImageGetWidth(cgClear) < 128 || CGImageGetHeight(cgClear) < 128) &&
+        [desc respondsToSelector:@selector(size)] &&
+        [desc respondsToSelector:@selector(setSize:)] &&
+        [desc respondsToSelector:@selector(scale)] &&
+        [desc respondsToSelector:@selector(setScale:)]) {
+        CGSize origSize = ((CGSize (*)(id, SEL))objc_msgSend)(desc, @selector(size));
+        NSInteger origScale = ((NSInteger (*)(id, SEL))objc_msgSend)(desc, @selector(scale));
+        if ([desc respondsToSelector:@selector(setForceClearBackground:)]) {
+            [desc setForceClearBackground:YES];
+        }
+        ((void (*)(id, SEL, CGSize))objc_msgSend)(desc, @selector(setSize:), CGSizeMake(64.0, 64.0));
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(desc, @selector(setScale:), 2);
+        id finProbe = ((id(*)(id, SEL, id, NSError **))s_orig_finalizedIconWithDescriptor)(
+            stack, sel_registerName("finalizedIconWithDescriptor:error:"), desc, NULL);
+        ((void (*)(id, SEL, CGSize))objc_msgSend)(desc, @selector(setSize:), origSize);
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(desc, @selector(setScale:), origScale);
+        if (finProbe) {
+            CGImageRef renderedProbe = dv_invokeSysGlassWithSteps(finProbe, sysGlassSel, sysGlassImp, cfg, 0x888ULL);
+            if (renderedProbe) cgProbe = renderedProbe;
+        }
+    }
+
     double scale = 1.0, cx = 0.5, cy = 0.5;
-    BOOL shouldStrip = dv_shouldStripLayeredIconCGImage(cgClear, &scale, &cx, &cy);
+    BOOL shouldStrip = dv_shouldStripLayeredIconCGImage(cgProbe, &scale, &cx, &cy);
     objc_setAssociatedObject(stack, kDVStackDecisionKey, @(shouldStrip), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (shouldStrip) {
         objc_setAssociatedObject(stack, kDVStackScaleKey, @(scale), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(stack, kDVStackCenterXKey, @(cx), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(stack, kDVStackCenterYKey, @(cy), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return dv_scaleTypeACGImage(cgClear, scale, cx, cy);
+        return dv_renderFinalizedIconAtNativeScale(stack, desc, sysGlassSel, sysGlassImp, cfg, cgClear, scale, cx, cy);
     }
 
     if ([desc respondsToSelector:@selector(setForceClearBackground:)]) {

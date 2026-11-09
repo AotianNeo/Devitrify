@@ -73,9 +73,6 @@ static void warmup_iconservicesagent_synchronously(void) {
 
         id desc = [[clsISDesc alloc] initWithSize:CGSizeMake(128, 128) scale:2.0];
         if (!desc) return;
-        if ([desc respondsToSelector:@selector(setIgnoreCache:)]) {
-            [desc setIgnoreCache:YES];
-        }
 
         NSArray<NSString *> *paths = @[
             @"/System/Library/CoreServices/Finder.app",
