@@ -170,9 +170,12 @@ else
 fi
 printf 'Done!\n'
 
-# The agent sets DYLD_INSERT_LIBRARIES asynchronously; wait for it before looking for apps.
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [ "$(launchctl getenv DYLD_INSERT_LIBRARIES)" = "$INSTALL_DIR/libDevitrify.dylib" ] && break
-    sleep 0.5
+# The agent sets DYLD_INSERT_LIBRARIES and starts Dock asynchronously; wait for it to finish.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ "$(launchctl getenv DYLD_INSERT_LIBRARIES)" = "$INSTALL_DIR/libDevitrify.dylib" ] && \
+       ! /usr/bin/pgrep -f "$INSTALL_DIR/devitrify-agent" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.3
 done
 "$INSTALL_DIR/devitrify-refresh"

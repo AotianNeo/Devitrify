@@ -33,6 +33,10 @@ if [ ! -d /Applications/Launchpad.app ] && [ -d "$INSTALL_DIR/Launchpad.app" ]; 
     /usr/bin/xattr -cr /Applications/Launchpad.app 2>/dev/null || true
 fi
 
+if [ -x "$INSTALL_DIR/devitrify-reload" ]; then
+    "$INSTALL_DIR/devitrify-reload" --login >/dev/null 2>&1
+fi
+
 # Start the Launchpad-enabled Dock with DynamicDesktop and WindowManager shims
 if [ -x "$INSTALL_DIR/Dock.app/Contents/MacOS/Dock" ]; then
     /bin/cp /System/Library/LaunchAgents/com.apple.Dock.plist "$INSTALL_DIR/com.apple.Dock.plist"
@@ -51,9 +55,5 @@ if [ -x "$INSTALL_DIR/Dock.app/Contents/MacOS/Dock" ]; then
     /bin/launchctl unload "$INSTALL_DIR/com.apple.Dock.plist" >/dev/null 2>&1 || true
     /bin/launchctl load "$INSTALL_DIR/com.apple.Dock.plist"
     /bin/launchctl start com.apple.Dock.agent
-fi
-
-if [ -x "$INSTALL_DIR/devitrify-reload" ]; then
-    "$INSTALL_DIR/devitrify-reload" --login >/dev/null 2>&1
 fi
 

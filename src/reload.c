@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +68,18 @@ static void move_to_trash_or_unlink(const char *src, const char *filename) {
 static void warmup_iconservicesagent_synchronously(void) {
     @autoreleasepool {
         dlopen("/System/Library/PrivateFrameworks/IconServices.framework/Versions/A/IconServices", RTLD_LAZY | RTLD_GLOBAL);
+        Class clsMgr = objc_getClass("ISIconManager");
+        SEL sharedSel = sel_registerName("sharedInstance");
+        SEL initSel = sel_registerName("_init");
+        if (clsMgr && [clsMgr respondsToSelector:sharedSel]) {
+            id mgr = ((id (*)(id, SEL))objc_msgSend)(clsMgr, sharedSel);
+            if (mgr && [mgr respondsToSelector:initSel]) {
+                @try {
+                    ((id (*)(id, SEL))objc_msgSend)(mgr, initSel);
+                } @catch (id ex) {}
+            }
+        }
+
         Class clsISIcon = objc_getClass("ISIcon");
         Class clsISDesc = objc_getClass("ISImageDescriptor");
         if (!clsISIcon || !clsISDesc) return;
@@ -76,6 +89,8 @@ static void warmup_iconservicesagent_synchronously(void) {
 
         NSArray<NSString *> *paths = @[
             @"/System/Library/CoreServices/Finder.app",
+            @"/Applications/Launchpad.app",
+            @"/System/Applications/Preview.app",
             @"/Applications/Safari.app"
         ];
         for (NSString *p in paths) {
@@ -92,24 +107,18 @@ static void warmup_iconservicesagent_synchronously(void) {
 }
 
 static void restart_iconservicesagent_only(void) {
-    char cmd[512];
-    uid_t uid = getuid();
-    snprintf(cmd, sizeof(cmd),
-        "/bin/launchctl bootout gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null; "
-        "/bin/launchctl bootstrap gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null",
-        (unsigned)uid, (unsigned)uid);
-    (void)system(cmd);
+    // Never run `launchctl bootout` on com.apple.iconservices.iconservicesagent.plist:
+    // booting out the LaunchAgent tears down the "com.apple.iconservices" Mach port in launchd,
+    // which sends XPC_ERROR_CONNECTION_INVALID (Code=4099) to every running client (Dock, Finder)
+    // and permanently invalidates their NSXPCConnection. Killing the process via killall -9
+    // preserves the launchd Mach service endpoint so launchd respawns iconservicesagent on-demand
+    // with the updated DYLD_INSERT_LIBRARIES environment.
+    (void)system("/usr/bin/killall -9 iconservicesagent 2>/dev/null");
     warmup_iconservicesagent_synchronously();
 }
 
 static void purge_and_refresh_icons(void) {
-    uid_t uid = getuid();
-    char stop_cmd[256];
-    snprintf(stop_cmd, sizeof(stop_cmd),
-        "/bin/launchctl bootout gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null",
-        (unsigned)uid);
-    (void)system(stop_cmd);
-    (void)system("/usr/bin/killall -9 DockHelper Launchpad 2>/dev/null");
+    (void)system("/usr/bin/killall -9 iconservicesagent DockHelper Launchpad 2>/dev/null");
 
     char cache_dir[PATH_MAX];
     if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache_dir, sizeof(cache_dir)) > 0) {
@@ -140,13 +149,9 @@ static void purge_and_refresh_icons(void) {
         }
     }
 
-    char start_cmd[256];
-    snprintf(start_cmd, sizeof(start_cmd),
-        "/bin/launchctl bootstrap gui/%u /System/Library/LaunchAgents/com.apple.iconservices.iconservicesagent.plist 2>/dev/null",
-        (unsigned)uid);
-    (void)system(start_cmd);
-
-    // Synchronously warm up iconservicesagent so it is alive and hooked before Dock/Finder restart.
+    // Kill iconservicesagent again in case an on-demand IPC spawned it while caches were being moved,
+    // then synchronously warm it up so a fresh store.index is active before Dock/Finder restart.
+    (void)system("/usr/bin/killall -9 iconservicesagent 2>/dev/null");
     warmup_iconservicesagent_synchronously();
 
     if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache_dir, sizeof(cache_dir)) > 0) {
@@ -549,6 +554,12 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Serialize concurrent reload invocations (e.g. devitrify-agent vs devitrify-refresh)
+    int lock_fd = open(RELOAD_DIR "/reload.lock", O_CREAT | O_RDWR, 0644);
+    if (lock_fd >= 0) {
+        (void)flock(lock_fd, LOCK_EX);
+    }
+
     if (mode_disable) {
         int fd = open(DISABLED_FILE, O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (fd >= 0) {
@@ -627,6 +638,7 @@ int main(int argc, char **argv) {
         } else {
             purge_and_refresh_icons();
         }
+        notify_post(NOTIFY_NAME);
     }
 
     // Pulse AppleICUForce24HourTime across AppleTimePreferencesChangedNotification so

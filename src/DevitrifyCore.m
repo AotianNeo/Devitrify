@@ -1738,6 +1738,13 @@ static BOOL swizzled_isCenterPixelTransparent(id self, SEL _cmd) {
 
 static void dv_normalizeISImageDescriptor(id desc) {
     if (!desc || s_core_hooks_disabled) return;
+    SEL appSel = sel_registerName("appearance");
+    SEL setAppSel = sel_registerName("setAppearance:");
+    if ([desc respondsToSelector:appSel] && [desc respondsToSelector:setAppSel]) {
+        if (((NSInteger (*)(id, SEL))objc_msgSend)(desc, appSel) != 0) {
+            ((void (*)(id, SEL, NSInteger))objc_msgSend)(desc, setAppSel, 0);
+        }
+    }
     if ([desc respondsToSelector:@selector(appearanceVariant)] &&
         [desc respondsToSelector:@selector(setAppearanceVariant:)]) {
         if ([desc appearanceVariant] != 0) {
@@ -1752,9 +1759,58 @@ static void dv_normalizeISImageDescriptor(id desc) {
     }
 }
 
+static __thread int s_in_heal_icon_mgr = 0;
+static void dv_healISIconManagerIfNeeded(BOOL force) {
+    if (s_core_hooks_disabled || s_in_heal_icon_mgr) return;
+    NSString *exe = NSBundle.mainBundle.executablePath ?: NSProcessInfo.processInfo.arguments.firstObject;
+    if (exe && ([exe hasSuffix:@"/iconservicesagent"] || [exe hasSuffix:@"/iconservicesd"])) {
+        return;
+    }
+    Class clsMgr = objc_getClass("ISIconManager");
+    if (!clsMgr) return;
+    SEL sharedSel = sel_registerName("sharedInstance");
+    SEL initSel = sel_registerName("_init");
+    if (![clsMgr respondsToSelector:sharedSel]) return;
+
+    s_in_heal_icon_mgr = 1;
+    @try {
+        id mgr = ((id (*)(id, SEL))objc_msgSend)(clsMgr, sharedSel);
+        if (mgr && [mgr respondsToSelector:initSel]) {
+            BOOL needsHeal = force;
+            if (!needsHeal) {
+                SEL cacheSel = sel_registerName("iconCache");
+                SEL urlSel = sel_registerName("cacheURL");
+                if ([mgr respondsToSelector:cacheSel]) {
+                    id cache = ((id (*)(id, SEL))objc_msgSend)(mgr, cacheSel);
+                    if (!cache) {
+                        needsHeal = YES;
+                    } else if ([cache respondsToSelector:urlSel]) {
+                        NSURL *u = ((NSURL * (*)(id, SEL))objc_msgSend)(cache, urlSel);
+                        NSString *p = u ? u.path : nil;
+                        if (!p.length || access(p.UTF8String, F_OK) != 0) {
+                            needsHeal = YES;
+                        }
+                    }
+                }
+            }
+            if (needsHeal) {
+                ((id (*)(id, SEL))objc_msgSend)(mgr, initSel);
+            }
+        }
+    } @catch (id ex) {}
+    s_in_heal_icon_mgr = 0;
+}
+
+static inline BOOL dv_isISImagePlaceholderOrNil(id img) {
+    if (!img) return YES;
+    SEL phSel = @selector(placeholder);
+    return ([img respondsToSelector:phSel] && [img placeholder]);
+}
+
 static IMP s_orig_isicon_prepareImages = NULL;
 static void swizzled_isicon_prepareImages(id self, SEL _cmd, NSArray *descs) {
     if (!s_core_hooks_disabled && [descs isKindOfClass:[NSArray class]]) {
+        dv_healISIconManagerIfNeeded(NO);
         for (id d in descs) {
             dv_normalizeISImageDescriptor(d);
         }
@@ -1764,29 +1820,93 @@ static void swizzled_isicon_prepareImages(id self, SEL _cmd, NSArray *descs) {
     }
 }
 
-static __thread int s_in_isicon_retry = 0;
-static IMP s_orig_isicon_imageForDescriptor = NULL;
-static id swizzled_isicon_imageForDescriptor(id self, SEL _cmd, id desc) {
-    if (!s_core_hooks_disabled) {
-        dv_normalizeISImageDescriptor(desc);
-    }
-    id img = s_orig_isicon_imageForDescriptor
-        ? ((id (*)(id, SEL, id))s_orig_isicon_imageForDescriptor)(self, _cmd, desc)
-        : nil;
-    if (!s_core_hooks_disabled && !s_in_isicon_retry && desc) {
-        BOOL isPh = (!img || ([img respondsToSelector:@selector(placeholder)] && [img placeholder]));
-        if (isPh && [self respondsToSelector:@selector(prepareImagesForImageDescriptors:)]) {
-            s_in_isicon_retry = 1;
-            @try {
-                [self prepareImagesForImageDescriptors:@[desc]];
-                if (s_orig_isicon_imageForDescriptor) {
-                    img = ((id (*)(id, SEL, id))s_orig_isicon_imageForDescriptor)(self, _cmd, desc);
-                }
-            } @catch (id ex) {}
-            s_in_isicon_retry = 0;
+static IMP s_orig_isicon_underscorePrepareImages = NULL;
+static void swizzled_isicon_underscorePrepareImages(id self, SEL _cmd, NSArray *descs) {
+    if (!s_core_hooks_disabled && [descs isKindOfClass:[NSArray class]]) {
+        dv_healISIconManagerIfNeeded(NO);
+        for (id d in descs) {
+            dv_normalizeISImageDescriptor(d);
         }
     }
+    if (s_orig_isicon_underscorePrepareImages) {
+        ((void (*)(id, SEL, NSArray *))s_orig_isicon_underscorePrepareImages)(self, _cmd, descs);
+    }
+}
+
+static __thread int s_in_isicon_gen_retry = 0;
+static IMP s_orig_isicon_generateImageWithDescriptor = NULL;
+static id swizzled_isicon_generateImageWithDescriptor(id self, SEL _cmd, id desc) {
+    if (!s_core_hooks_disabled) {
+        dv_healISIconManagerIfNeeded(NO);
+        dv_normalizeISImageDescriptor(desc);
+    }
+    id img = s_orig_isicon_generateImageWithDescriptor
+        ? ((id (*)(id, SEL, id))s_orig_isicon_generateImageWithDescriptor)(self, _cmd, desc)
+        : nil;
+    if (!s_core_hooks_disabled && !s_in_isicon_gen_retry && desc && dv_isISImagePlaceholderOrNil(img)) {
+        s_in_isicon_gen_retry = 1;
+        @try {
+            for (int attempt = 0; attempt < 2 && dv_isISImagePlaceholderOrNil(img); attempt++) {
+                if (attempt == 1) {
+                    usleep(40000);
+                }
+                dv_healISIconManagerIfNeeded(YES);
+                if (s_orig_isicon_generateImageWithDescriptor) {
+                    img = ((id (*)(id, SEL, id))s_orig_isicon_generateImageWithDescriptor)(self, _cmd, desc);
+                }
+            }
+        } @catch (id ex) {}
+        s_in_isicon_gen_retry = 0;
+    }
     return img;
+}
+
+static __thread int s_in_isicon_retry = 0;
+static IMP s_orig_isicon_imageForDescriptor = NULL;
+static IMP s_orig_isicon_imageForDescriptor_short = NULL;
+
+static id dv_isicon_fetchWithRetry(id self, SEL _cmd, id desc, IMP origImp) {
+    if (!s_core_hooks_disabled) {
+        dv_healISIconManagerIfNeeded(NO);
+        dv_normalizeISImageDescriptor(desc);
+    }
+    id img = origImp ? ((id (*)(id, SEL, id))origImp)(self, _cmd, desc) : nil;
+    if (!s_core_hooks_disabled && !s_in_isicon_retry && desc && dv_isISImagePlaceholderOrNil(img)) {
+        s_in_isicon_retry = 1;
+        @try {
+            SEL uPrepSel = sel_registerName("_prepareImagesForImageDescriptors:");
+            SEL prepSel = @selector(prepareImagesForImageDescriptors:);
+            if ([self respondsToSelector:uPrepSel]) {
+                ((void (*)(id, SEL, NSArray *))objc_msgSend)(self, uPrepSel, @[desc]);
+            } else if ([self respondsToSelector:prepSel]) {
+                [self prepareImagesForImageDescriptors:@[desc]];
+            }
+            if (origImp) {
+                img = ((id (*)(id, SEL, id))origImp)(self, _cmd, desc);
+            }
+            if (dv_isISImagePlaceholderOrNil(img)) {
+                dv_healISIconManagerIfNeeded(YES);
+                if ([self respondsToSelector:uPrepSel]) {
+                    ((void (*)(id, SEL, NSArray *))objc_msgSend)(self, uPrepSel, @[desc]);
+                } else if ([self respondsToSelector:prepSel]) {
+                    [self prepareImagesForImageDescriptors:@[desc]];
+                }
+                if (origImp) {
+                    img = ((id (*)(id, SEL, id))origImp)(self, _cmd, desc);
+                }
+            }
+        } @catch (id ex) {}
+        s_in_isicon_retry = 0;
+    }
+    return img;
+}
+
+static id swizzled_isicon_imageForDescriptor(id self, SEL _cmd, id desc) {
+    return dv_isicon_fetchWithRetry(self, _cmd, desc, s_orig_isicon_imageForDescriptor);
+}
+
+static id swizzled_isicon_imageForDescriptor_short(id self, SEL _cmd, id desc) {
+    return dv_isicon_fetchWithRetry(self, _cmd, desc, s_orig_isicon_imageForDescriptor_short);
 }
 
 static Class dv_classImplementingSelector(Class cls, SEL sel) {
@@ -1978,11 +2098,31 @@ static void dv_installIconJailNeutralization(void) {
         if (prepCls) {
             dv_swizzle(prepCls, prepSel, (IMP)swizzled_isicon_prepareImages, &s_orig_isicon_prepareImages);
         }
+        SEL uPrepSel = sel_registerName("_prepareImagesForImageDescriptors:");
+        Class uPrepCls = dv_classImplementingSelector(clsISIconBase, uPrepSel);
+        if (uPrepCls) {
+            dv_swizzle(uPrepCls, uPrepSel, (IMP)swizzled_isicon_underscorePrepareImages, &s_orig_isicon_underscorePrepareImages);
+        }
+        SEL genSel = sel_registerName("generateImageWithDescriptor:");
+        Class genCls = dv_classImplementingSelector(clsISIconBase, genSel);
+        if (genCls) {
+            dv_swizzle(genCls, genSel, (IMP)swizzled_isicon_generateImageWithDescriptor, &s_orig_isicon_generateImageWithDescriptor);
+        }
         SEL imgSel = sel_registerName("imageForImageDescriptor:");
         Class imgCls = dv_classImplementingSelector(clsISIconBase, imgSel);
         if (imgCls) {
             dv_swizzle(imgCls, imgSel, (IMP)swizzled_isicon_imageForDescriptor, &s_orig_isicon_imageForDescriptor);
         }
+        SEL imgShortSel = sel_registerName("imageForDescriptor:");
+        Class imgShortCls = dv_classImplementingSelector(clsISIconBase, imgShortSel);
+        if (imgShortCls) {
+            dv_swizzle(imgShortCls, imgShortSel, (IMP)swizzled_isicon_imageForDescriptor_short, &s_orig_isicon_imageForDescriptor_short);
+        }
+    }
+
+    NSString *exe = NSBundle.mainBundle.executablePath ?: NSProcessInfo.processInfo.arguments.firstObject;
+    if (exe && ([exe hasSuffix:@"/Dock"] || [exe hasSuffix:@"/Finder"])) {
+        dv_healISIconManagerIfNeeded(YES);
     }
 
     // Dock tile & appearance chiclet neutralization
